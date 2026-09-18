@@ -1,0 +1,9 @@
+Security overview
+
+All service-to-service traffic uses TLS. Production database backups are encrypted with keys managed separately from application credentials. Employees must use multi-factor authentication to access production systems.
+
+Suspected security incidents should be reported immediately through the incident response channel. The on-call security engineer will triage each report and coordinate containment.
+
+Access to customer data follows least-privilege principles. Production access is granted for a defined business need, reviewed quarterly, and revoked when an employee changes roles or leaves the company. Administrative actions are recorded in audit logs.
+
+The engineering team performs regular vulnerability scanning and applies security updates according to severity. Critical vulnerabilities are prioritized for expedited remediation, while all employees complete annual security and privacy training.

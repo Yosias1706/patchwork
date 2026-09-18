@@ -1,0 +1,49 @@
+[build-system]
+requires = ["hatchling>=1.25"]
+build-backend = "hatchling.build"
+
+[project]
+name = "patchwork-rag"
+version = "0.2.0"
+description = "Repository-aware RAG for retrieving historical bug fixes"
+readme = "README.md"
+requires-python = ">=3.11"
+license = { text = "MIT" }
+authors = [{ name = "Patchwork contributors" }]
+dependencies = [
+  "cryptography>=43,<46",
+  "fastapi>=0.115,<1.0",
+  "psycopg[binary]>=3.2,<4.0",
+  "python-dotenv>=1.0,<2.0",
+  "python-multipart>=0.0.9",
+  "uvicorn[standard]>=0.30,<1.0",
+]
+
+[project.optional-dependencies]
+documents = [
+  "pypdf>=5.0,<7.0",
+  "python-docx>=1.1,<2.0",
+]
+dev = [
+  "pytest>=8.0,<9.0",
+  "ruff>=0.8,<1.0",
+]
+
+[project.scripts]
+patchwork = "rag_document_search.cli:main"
+rag-search = "rag_document_search.cli:main"
+
+[tool.hatch.build.targets.wheel]
+packages = ["src/rag_document_search"]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+addopts = "-q"
+
+[tool.ruff]
+target-version = "py311"
+line-length = 100
+
+[tool.ruff.lint]
+select = ["E", "F", "I", "UP", "B"]
+ignore = ["B008"]

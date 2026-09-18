@@ -1,0 +1,42 @@
+# Render Blueprint for the public Patchwork portfolio deployment.
+#
+# This app serves the built React dashboard and FastAPI API from one origin.
+# It intentionally expects a managed PostgreSQL URL rather than provisioning a
+# Render Free Postgres instance: Render's free database expires after 30 days.
+# Use a durable free-tier Postgres provider such as Neon for the RAG data.
+services:
+  - type: web
+    name: patchwork-rag
+    runtime: docker
+    plan: free
+    region: oregon
+    dockerfilePath: ./Dockerfile
+    healthCheckPath: /health
+    autoDeployTrigger: commit
+    envVars:
+      - key: RAG_DATABASE_URL
+        sync: false
+      - key: PATCHWORK_TOKEN_ENCRYPTION_KEY
+        generateValue: true
+      - key: PATCHWORK_GITHUB_API_URL
+        value: https://api.github.com
+      - key: PATCHWORK_GITHUB_GRAPHQL_URL
+        value: https://api.github.com/graphql
+      - key: PATCHWORK_DEFAULT_PULL_LIMIT
+        value: "15"
+      - key: PATCHWORK_SYNC_WORKER_POLL_SECONDS
+        value: "2"
+      - key: PATCHWORK_SYNC_LEASE_SECONDS
+        value: "900"
+      - key: RAG_CHUNK_SIZE
+        value: "900"
+      - key: RAG_CHUNK_OVERLAP
+        value: "150"
+      - key: RAG_TOP_K
+        value: "5"
+      - key: RAG_HASHING_DIMENSIONS
+        value: "768"
+      - key: RAG_EMBEDDING_PROVIDER
+        value: hashing
+      - key: RAG_LLM_PROVIDER
+        value: extractive

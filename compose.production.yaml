@@ -1,0 +1,43 @@
+name: patchwork-production
+
+services:
+  database:
+    image: postgres:16-alpine
+    restart: unless-stopped
+    environment:
+      POSTGRES_DB: ${PATCHWORK_POSTGRES_DB:-patchwork}
+      POSTGRES_USER: ${PATCHWORK_POSTGRES_USER:-patchwork}
+      POSTGRES_PASSWORD: ${PATCHWORK_POSTGRES_PASSWORD:?Set PATCHWORK_POSTGRES_PASSWORD in .env}
+    volumes:
+      - patchwork_postgres_data:/var/lib/postgresql/data
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U $${POSTGRES_USER} -d $${POSTGRES_DB}"]
+      interval: 5s
+      timeout: 5s
+      retries: 12
+
+  api:
+    build:
+      context: .
+      args:
+        VITE_API_URL: ""
+    restart: unless-stopped
+    env_file: .env
+    environment:
+      RAG_DATABASE_URL: postgresql://${PATCHWORK_POSTGRES_USER:-patchwork}:${PATCHWORK_POSTGRES_PASSWORD:?Set PATCHWORK_POSTGRES_PASSWORD in .env}@database:5432/${PATCHWORK_POSTGRES_DB:-patchwork}
+      PATCHWORK_WEB_URL: ${PATCHWORK_PUBLIC_URL:-http://localhost:8000}
+      RAG_CORS_ORIGINS: ${PATCHWORK_PUBLIC_URL:-http://localhost:8000}
+      PATCHWORK_WEB_DIST: /app/web-dist
+    depends_on:
+      database:
+        condition: service_healthy
+    ports:
+      - "${PATCHWORK_PORT:-8000}:8000"
+    healthcheck:
+      test: ["CMD-SHELL", "python -c \"import urllib.request; urllib.request.urlopen('http://127.0.0.1:8000/health', timeout=2)\""]
+      interval: 15s
+      timeout: 5s
+      retries: 5
+
+volumes:
+  patchwork_postgres_data:
