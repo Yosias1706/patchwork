@@ -7,10 +7,10 @@ It is deliberately evidence-first: an investigation returns the matching pull re
 ## What it demonstrates
 
 - Repository-scoped retrieval: results from one connected repository cannot leak into another.
-- GitHub ingestion: closed PRs labelled `bug`, their merged diffs, metadata, and test-file signals become searchable patch cards.
+- GitHub ingestion: a balanced mix of `bug`-labelled PRs and unlabelled repair-like merged PRs (for example, regressions, races, timeouts, cleanup, and validation fixes) becomes searchable patch cards.
 - GitHub account linking: users can optionally authorize their own GitHub account for private-repository reads; access tokens are encrypted at rest and never reach the browser.
 - Grounded RAG: answers cite the indexed pull requests that support them.
-- An evidence-first investigation agent: it extracts error signatures, paths, and symbols; runs a fixed set of repository-scoped searches; fuses results; and exposes its trace and confidence rationale.
+- An evidence-first investigation agent: it extracts error signatures, paths, and symbols; runs a fixed set of repository-scoped searches; fuses results; and produces a cited implementation plan with files and regression coverage to review.
 - Operational state: PostgreSQL persists repository connections, documents, chunks, sync runs, and evaluation runs.
 - Retrieval evaluation: durable GitHub issue → fixing-PR manifests are measured with Recall@1, Recall@3, MRR, and retrieval-miss samples without indexing the evaluation query into its target PR.
 - A React + Tailwind dashboard and a CLI, backed by FastAPI.
@@ -203,11 +203,11 @@ Copy `.env.example` to `.env`. Environment variables take precedence.
 | `PATCHWORK_GITHUB_OAUTH_REDIRECT_URL` | unset | Exact GitHub OAuth callback URL: `/auth/github/callback`. |
 | `PATCHWORK_TOKEN_ENCRYPTION_KEY` | unset | Stable Fernet key for encrypting stored GitHub access/refresh tokens. |
 | `PATCHWORK_WEB_URL` | local Vite URL | Dashboard URL used after a GitHub OAuth callback. |
-| `PATCHWORK_DEFAULT_PULL_LIMIT` | `15` | Number of bug-fix PR candidates considered per sync, 1–30 through the API. |
+| `PATCHWORK_DEFAULT_PULL_LIMIT` | `15` | Number of selected repair-history PRs indexed per sync, 1–30 through the API. Patchwork scans a wider recent window to include relevant unlabelled fixes. |
 | `PATCHWORK_SYNC_LEASE_SECONDS` | `900` | Time after which an abandoned sync can be safely reclaimed. |
 | `RAG_CORS_ORIGINS` | local Vite origins | Browser origins allowed to call the API. |
 | `RAG_EMBEDDING_PROVIDER` | `hashing` | `hashing` or `openai_compatible`. |
-| `RAG_LLM_PROVIDER` | `extractive` | `extractive` or `openai_compatible`. |
+| `RAG_LLM_PROVIDER` | `extractive` | `extractive` produces evidence-guided implementation plans; `openai_compatible` additionally produces a grounded model-assisted plan from retrieved Patchwork evidence. |
 | `RAG_OPENAI_BASE_URL` | `https://api.openai.com/v1` | Compatible API base URL. |
 | `RAG_OPENAI_API_KEY` | unset | Required when using the compatible provider. |
 

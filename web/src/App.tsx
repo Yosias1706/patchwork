@@ -77,12 +77,24 @@ type PatchMatch = {
   pull_number: number | null;
   pull_url: string;
   title: string;
+  score: number;
   merge_commit_sha: string | null;
   linked_issue_number?: number | null;
   linked_issue_url?: string | null;
   changed_files: string[];
   test_files: string[];
   excerpt: string;
+  recommended_solution?: RecommendedSolution;
+};
+
+type RecommendedSolution = {
+  assessment: string;
+  implementation_steps: string[];
+  code_guidance: string | null;
+  verification: string[];
+  cautions: string[];
+  source_pull_numbers: number[];
+  mode: "model_assisted" | "evidence_guided";
 };
 
 type Investigation = {
@@ -90,6 +102,7 @@ type Investigation = {
   summary: string;
   matches: PatchMatch[];
   confidence: "high" | "moderate" | "low" | "no_similar_fix_found";
+  recommended_solution?: RecommendedSolution;
 };
 
 type User = {
@@ -688,7 +701,23 @@ function MatchEvidence({ match }: { match: PatchMatch }) {
   const files = match.changed_files.slice(0, 4);
   const tests = match.test_files.slice(0, 3);
   if (!files.length && !tests.length) return null;
-  return <div className="mt-5 grid gap-4 rounded-xl border border-[#e7ece6] bg-[#f8faf7] p-4 sm:grid-cols-2"><EvidenceFiles label="Files to inspect" files={files} icon={<Code2 size={13} />} /><EvidenceFiles label="Regression coverage" files={tests} icon={<Check size={13} />} emptyText="No test file was detected." /></div>;
+  return <><div className="mt-5 grid gap-4 rounded-xl border border-[#e7ece6] bg-[#f8faf7] p-4 sm:grid-cols-2"><EvidenceFiles label="Files to inspect" files={files} icon={<Code2 size={13} />} /><EvidenceFiles label="Regression coverage" files={tests} icon={<Check size={13} />} emptyText="No test file was detected." /><div className="sm:col-span-2"><RelevanceBadge score={match.score} /></div></div><SolutionPlan solution={match.recommended_solution} /></>;
+}
+
+function RelevanceBadge({ score }: { score: number }) {
+  const percent = Math.round(Math.min(1, Math.max(0, score)) * 100);
+  return <p className="text-xs text-[#71877c]"><span className="font-semibold text-[#527064]">Relevance: {percent}%</span><span className="ml-2">Similarity to your report, not a probability of a correct fix.</span></p>;
+}
+
+function SolutionPlan({ solution }: { solution?: RecommendedSolution }) {
+  if (!solution) return null;
+  const modelAssisted = solution.mode === "model_assisted";
+  return <section className="mt-5 rounded-xl border border-[#dce9d8] bg-[#f5faf2] p-4"><div className="flex flex-wrap items-center justify-between gap-2"><h3 className="text-sm font-semibold text-ink">Suggested implementation approach</h3><span className={`rounded-full px-2 py-1 text-[10px] font-bold ${modelAssisted ? "bg-[#dbeee0] text-moss" : "bg-[#edf1eb] text-[#627a6d]"}`}>{modelAssisted ? "Model-assisted" : "Evidence-guided"}</span></div><p className="mt-2 text-sm leading-6 text-[#527064]">{solution.assessment}</p><PlanList label="Suggested steps" items={solution.implementation_steps} /><PlanList label="Verify" items={solution.verification} /><PlanList label="Keep in mind" items={solution.cautions} muted />{solution.code_guidance && <div className="mt-4"><p className="text-[10px] font-bold uppercase tracking-[0.12em] text-[#71877c]">Illustrative code guidance</p><pre className="mt-2 overflow-x-auto rounded-lg bg-[#17372f] p-3 text-xs leading-5 text-[#e9f4e5]"><code>{solution.code_guidance}</code></pre></div>}</section>;
+}
+
+function PlanList({ label, items, muted = false }: { label: string; items: string[]; muted?: boolean }) {
+  if (!items.length) return null;
+  return <div className="mt-4"><p className="text-[10px] font-bold uppercase tracking-[0.12em] text-[#71877c]">{label}</p><ul className={`mt-2 space-y-1.5 text-sm leading-5 ${muted ? "text-[#71877c]" : "text-[#527064]"}`}>{items.map((item, index) => <li key={`${label}-${index}`} className="flex gap-2"><span className="mt-2 size-1.5 shrink-0 rounded-full bg-sage" />{item}</li>)}</ul></div>;
 }
 
 function EvidenceFiles({ label, files, icon, emptyText }: { label: string; files: string[]; icon: ReactNode; emptyText?: string }) {

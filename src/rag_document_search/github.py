@@ -14,7 +14,14 @@ from typing import Any
 
 from .models import SourceDocument
 
-_BUG_WORDS = re.compile(r"\b(bug|fix(?:ed|es|ing)?|crash|regression|deadlock|error|panic)\b", re.I)
+_REPAIR_WORDS = re.compile(
+    r"\b("
+    r"bug|fix(?:ed|es|ing)?|crash|regression|deadlock|error|panic|"
+    r"hang|timeout|leak|race|retry|recover|prevent|avoid|guard|"
+    r"correct|incorrect|invalid|failure|broken|cleanup|validate|sanitize"
+    r")\b",
+    re.I,
+)
 _CLOSING_ISSUE = re.compile(
     r"\b(?:close[sd]?|fix(?:e[sd])?|resolve[sd]?)\s+(?:[\w-]+/[\w.-]+)?#(\d+)\b", re.I
 )
@@ -64,7 +71,9 @@ def parse_github_repository_url(value: str) -> tuple[str, str]:
     """Return owner/repository from a canonical public GitHub repository URL."""
     parsed = urllib.parse.urlparse(value.strip())
     if parsed.scheme not in {"http", "https"} or parsed.netloc.lower() != "github.com":
-        raise GitHubError("Enter a GitHub repository URL such as https://github.com/owner/repository")
+        raise GitHubError(
+            "Enter a GitHub repository URL such as https://github.com/owner/repository"
+        )
     parts = [part for part in parsed.path.split("/") if part]
     if len(parts) != 2:
         raise GitHubError("The URL must point to a repository, not a file, pull request, or issue")
@@ -118,10 +127,10 @@ class GitHubClient:
     def patch_cards(
         self, repository: GitHubRepository, *, limit: int
     ) -> tuple[int, list[PatchCard]]:
-        """Build citation-ready patch documents from recent merged bug-fix pull requests."""
+        """Build repair-history cards from bug-labelled and repair-like merged PRs."""
         if not 1 <= limit <= 30:
             raise ValueError("Patchwork supports between 1 and 30 pull requests per sync")
-        candidates = self._get(
+        labelled_issues = self._get(
             f"/repos/{repository.owner}/{repository.name}/issues",
             {
                 "state": "closed",
@@ -131,16 +140,20 @@ class GitHubClient:
                 "per_page": limit,
             },
         )
-        if not isinstance(candidates, list):
+        if not isinstance(labelled_issues, list):
             raise GitHubError("GitHub returned an unexpected issue listing")
-        pulls = [candidate for candidate in candidates if candidate.get("pull_request")]
-        if not pulls:
-            pulls = self._get(
-                f"/repos/{repository.owner}/{repository.name}/pulls",
-                {"state": "closed", "sort": "updated", "direction": "desc", "per_page": limit},
-            )
-            if not isinstance(pulls, list):
-                raise GitHubError("GitHub returned an unexpected pull-request listing")
+
+        scan_limit = min(max(limit * 3, 30), 100)
+        recent_pulls = self._get(
+            f"/repos/{repository.owner}/{repository.name}/pulls",
+            {"state": "closed", "sort": "updated", "direction": "desc", "per_page": scan_limit},
+        )
+        if not isinstance(recent_pulls, list):
+            raise GitHubError("GitHub returned an unexpected pull-request listing")
+        labelled_pulls = [
+            candidate for candidate in labelled_issues if candidate.get("pull_request")
+        ]
+        pulls = _balanced_repair_candidates(labelled_pulls, recent_pulls, limit)
 
         cards: list[PatchCard] = []
         for summary in pulls:
@@ -158,7 +171,7 @@ class GitHubClient:
                 )
             linked_issue = self._linked_issue(repository, pull)
             cards.append(_patch_card(repository, pull, files, linked_issue))
-        return len(pulls), cards
+        return len(labelled_pulls) + len(recent_pulls), cards
 
     def _linked_issue(
         self, repository: GitHubRepository, pull: dict[str, Any]
@@ -301,7 +314,35 @@ def _looks_like_bug_fix(pull: dict[str, Any]) -> bool:
         for part in (str(pull.get("title", "")), _optional_text(pull.get("body")), labels)
         if part
     )
-    return bool(_BUG_WORDS.search(candidate_text))
+    return bool(_REPAIR_WORDS.search(candidate_text)) or bool(
+        _CLOSING_ISSUE.search(_optional_text(pull.get("body")) or "")
+    )
+
+
+def _balanced_repair_candidates(
+    labelled_pulls: list[dict[str, Any]], recent_pulls: list[dict[str, Any]], limit: int
+) -> list[dict[str, Any]]:
+    """Retain labelled bugs while reserving room for unlabelled repair signals."""
+    labelled = [pull for pull in labelled_pulls if pull.get("number")]
+    repair_like = [
+        pull for pull in recent_pulls if _looks_like_bug_fix(pull) and pull.get("number")
+    ]
+    labelled_quota = max(1, (limit * 3 + 4) // 5)
+    chosen: list[dict[str, Any]] = []
+    seen: set[int] = set()
+
+    def add(candidates: list[dict[str, Any]], maximum: int) -> None:
+        for candidate in candidates:
+            number = int(candidate["number"])
+            if number in seen or len(chosen) >= maximum:
+                continue
+            chosen.append(candidate)
+            seen.add(number)
+
+    add(labelled, labelled_quota)
+    add(repair_like, limit)
+    add(labelled, limit)
+    return chosen[:limit]
 
 
 def _closing_issue_numbers(body: str) -> list[int]:

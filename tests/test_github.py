@@ -5,6 +5,7 @@ from rag_document_search.github import (
     GitHubError,
     GitHubIssueLink,
     GitHubRepository,
+    _balanced_repair_candidates,
     _closing_issue_numbers,
     _patch_card,
     parse_github_repository_url,
@@ -77,6 +78,18 @@ def test_patch_card_keeps_diff_and_linked_issue_metadata() -> None:
 
 def test_closing_issue_numbers_uses_only_closing_references() -> None:
     assert _closing_issue_numbers("Related to #4. Fixes #9 and resolves #11.") == [9, 11]
+
+
+def test_repair_selection_keeps_untagged_repair_history() -> None:
+    labelled = [{"number": 1, "title": "Fix login crash", "labels": [{"name": "bug"}]}]
+    recent = [
+        {"number": 2, "title": "Prevent cleanup race", "labels": []},
+        {"number": 3, "title": "Add dashboard color", "labels": []},
+    ]
+
+    selected = _balanced_repair_candidates(labelled, recent, limit=2)
+
+    assert [pull["number"] for pull in selected] == [1, 2]
 
 
 def test_github_timeout_becomes_a_recoverable_error(monkeypatch: pytest.MonkeyPatch) -> None:

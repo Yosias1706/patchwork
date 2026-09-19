@@ -12,6 +12,7 @@ from .investigator import InvestigationAgent
 from .models import SourceDocument
 from .repository import PostgresIndex
 from .service import RAGService
+from .solution_agent import SolutionAgent, build_solution_generator
 
 
 class PatchworkService:
@@ -22,6 +23,7 @@ class PatchworkService:
         self.index = rag.index
         self.github_oauth = GitHubOAuthService(self.index, rag.settings)
         self.investigator = InvestigationAgent(rag)
+        self.solution_agent = SolutionAgent(build_solution_generator(rag.settings))
 
     def connect_repository(
         self, github_url: str, *, user_id: str, pull_limit: int | None = None
@@ -102,6 +104,10 @@ class PatchworkService:
         retrieval = self.investigator.retrieve(repository_id, issue, limit=limit)
         matches = _deduplicated_patch_matches(retrieval.citations)
         summary = _investigation_summary(matches)
+        recommended_solution = self.solution_agent.recommend(issue, matches, retrieval.citations)
+        recommended_solution_details = recommended_solution.as_api_details()
+        if matches:
+            matches[0]["recommended_solution"] = recommended_solution_details
         result = {
             "issue": issue,
             "summary": summary,
@@ -109,6 +115,7 @@ class PatchworkService:
             "matches": matches,
             "citations": [asdict(hit) for hit in retrieval.citations],
             "confidence": retrieval.confidence,
+            "recommended_solution": recommended_solution_details,
             "agent": retrieval.as_api_details(),
         }
         saved = self.index.save_patchwork_investigation(
