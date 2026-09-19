@@ -355,19 +355,15 @@ def _investigation_summary(matches: list[dict[str, object]]) -> str:
     leading = matches[0]
     title = re.sub(r"^PR #\d+\s*·\s*", "", str(leading["title"]))
     pull_number = leading.get("pull_number")
-    summary = str(leading["excerpt"])
-    changed_files = [str(path) for path in leading.get("changed_files", [])[:2]]
-    test_files = [str(path) for path in leading.get("test_files", [])[:2]]
-    result = f"Closest historical match (PR #{pull_number}): {title}. {summary}"
-    if changed_files:
-        result += f" It changed {', '.join(changed_files)}."
-    if test_files:
-        result += f" Regression coverage was added in {', '.join(test_files)}."
-    return result
+    return (
+        f"Start with PR #{pull_number}, \u201c{title}.\u201d It is the closest historical "
+        "fix in this repository; review its implementation and regression coverage before "
+        "applying the same approach."
+    )
 
 
 def _patch_excerpt(text: str) -> str:
-    """Return the human explanation section, never an unprocessed diff fragment."""
+    """Return a concise, plain-language PR explanation without template clutter."""
     if "## Problem and resolution" not in text:
         return (
             "Patchwork found related code changes; open this pull request to review the "
@@ -376,8 +372,47 @@ def _patch_excerpt(text: str) -> str:
     text = text.split("## Problem and resolution", maxsplit=1)[1]
     text = text.split("## Changed tests", maxsplit=1)[0]
     text = text.split("## Relevant diff hunks", maxsplit=1)[0]
-    cleaned = re.sub(r"\s+", " ", text).strip(" -:")
+    cleaned = _clean_pull_request_prose(text)
     if not cleaned:
         return "This historical pull request is a potentially relevant implementation reference."
     sentences = re.split(r"(?<=[.!?])\s+", cleaned)
-    return " ".join(sentences[:2])[:420].rstrip()
+    return " ".join(sentences[:2])[:320].rstrip()
+
+
+def _clean_pull_request_prose(text: str) -> str:
+    """Flatten Markdown while removing common PR-template fields and checklists."""
+    text = re.sub(r"<!--[\s\S]*?-->", " ", text)
+    text = re.sub(r"!\[([^\]]*)\]\([^)]*\)", r"\1", text)
+    text = re.sub(r"\[([^\]]+)\]\([^)]*\)", r"\1", text)
+    text = re.sub(r"```[\s\S]*?```", " ", text)
+
+    useful_lines: list[str] = []
+    for raw_line in text.splitlines():
+        line = raw_line.strip()
+        if not line or line.startswith(("```", "<")):
+            continue
+        normalized = re.sub(r"^#{1,6}\s*", "", line).strip().lower().rstrip(":")
+        if normalized in {
+            "checklist",
+            "testing",
+            "test plan",
+            "screenshots",
+            "type of change",
+            "related issues",
+            "related issue",
+            "additional context",
+            "reviewers",
+        }:
+            continue
+        if re.match(r"^[-*]\s*\[[ xX]\]", line):
+            continue
+        if re.match(r"^(close[sd]?|fixe[sd]?|resolve[sd]?)\s+#?\d+\b", line, re.I):
+            continue
+        line = re.sub(r"^#{1,6}\s*", "", line)
+        line = re.sub(r"^[-*+]\s+", "", line)
+        line = re.sub(r"`([^`]+)`", r"\1", line)
+        line = re.sub(r"[*_~]", "", line)
+        if line:
+            useful_lines.append(line)
+
+    return re.sub(r"\s+", " ", " ".join(useful_lines)).strip(" -:")

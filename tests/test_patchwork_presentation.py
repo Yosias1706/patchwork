@@ -27,8 +27,19 @@ def test_investigation_summary_uses_a_readable_pull_request_title() -> None:
         ]
     )
 
-    assert "PR #42): Fix disconnect cleanup race" in summary
-    assert "Regression coverage was added" in summary
+    assert "PR #42, \u201cFix disconnect cleanup race.\u201d" in summary
+    assert "regression coverage" in summary
+
+
+def test_patch_excerpt_removes_pull_request_template_noise() -> None:
+    excerpt = _patch_excerpt(
+        "## Problem and resolution\n"
+        "**Disconnects** could leave cleanup work pending. [Details](https://example.test).\n"
+        "\n## Checklist\n- [x] Added tests\n\nFixes #42\n"
+        "\n## Changed tests\n- tests/test_cleanup.py"
+    )
+
+    assert excerpt == "Disconnects could leave cleanup work pending. Details."
 
 
 def test_evaluation_uses_fix_description_when_a_linked_issue_is_unavailable() -> None:
