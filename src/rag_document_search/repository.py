@@ -775,7 +775,7 @@ class PostgresIndex:
                     chunks_indexed = COALESCE(%s, chunks_indexed),
                     state = COALESCE(%s, state),
                     available_at = CASE
-                        WHEN %s IS NULL THEN CURRENT_TIMESTAMP
+                        WHEN %s::INTEGER IS NULL THEN CURRENT_TIMESTAMP
                         ELSE CURRENT_TIMESTAMP + (%s * INTERVAL '1 second')
                     END,
                     error = %s,
