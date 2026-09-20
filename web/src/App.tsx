@@ -319,7 +319,7 @@ export default function App() {
       const response = await request<{ repository: Repository }>("/patchwork/repositories", {
         method: "POST",
         headers: { "Content-Type": "application/json" },
-        body: JSON.stringify({ github_url: repositoryUrl.trim(), pull_limit: 15 }),
+        body: JSON.stringify({ github_url: repositoryUrl.trim() }),
       });
       setSelectedRepositoryId(response.repository.id);
       setView("investigate");
@@ -340,7 +340,7 @@ export default function App() {
       await request(`/patchwork/repositories/${repository.id}/sync`, {
         method: "POST",
         headers: { "Content-Type": "application/json" },
-        body: JSON.stringify({ pull_limit: 15 }),
+        body: JSON.stringify({}),
       });
       setNotice(`Refreshing historical fixes for ${repository.full_name}.`);
       await refreshRepositories();
