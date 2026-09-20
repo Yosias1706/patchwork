@@ -23,7 +23,7 @@ services:
       - key: PATCHWORK_GITHUB_GRAPHQL_URL
         value: https://api.github.com/graphql
       - key: PATCHWORK_DEFAULT_PULL_LIMIT
-        value: "300"
+        value: "10000"
       - key: PATCHWORK_SYNC_WORKER_POLL_SECONDS
         value: "2"
       - key: PATCHWORK_SYNC_LEASE_SECONDS

@@ -203,7 +203,7 @@ Copy `.env.example` to `.env`. Environment variables take precedence.
 | `PATCHWORK_GITHUB_OAUTH_REDIRECT_URL` | unset | Exact GitHub OAuth callback URL: `/auth/github/callback`. |
 | `PATCHWORK_TOKEN_ENCRYPTION_KEY` | unset | Stable Fernet key for encrypting stored GitHub access/refresh tokens. |
 | `PATCHWORK_WEB_URL` | local Vite URL | Dashboard URL used after a GitHub OAuth callback. |
-| `PATCHWORK_DEFAULT_PULL_LIMIT` | `300` | Number of selected repair-history PRs indexed per sync, 1–300 through the API. Patchwork paginates closed-PR summaries across up to 10,000 PRs, then retrieves detailed diffs only for repair candidates. |
+| `PATCHWORK_DEFAULT_PULL_LIMIT` | `10000` | Maximum repair candidates to index, 1–10,000 through the API. Patchwork pages through up to 10,000 closed-PR summaries and rate-limits/checkpoints detailed repair indexing so a sync resumes safely after an interruption. |
 | `PATCHWORK_SYNC_LEASE_SECONDS` | `900` | Time after which an abandoned sync can be safely reclaimed. |
 | `RAG_CORS_ORIGINS` | local Vite origins | Browser origins allowed to call the API. |
 | `RAG_EMBEDDING_PROVIDER` | `hashing` | `hashing` or `openai_compatible`. |

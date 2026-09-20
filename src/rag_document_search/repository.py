@@ -194,6 +194,8 @@ class PostgresIndex:
                     patch_cards_indexed INTEGER NOT NULL DEFAULT 0,
                     chunks_indexed INTEGER NOT NULL DEFAULT 0,
                     attempt_count INTEGER NOT NULL DEFAULT 0,
+                    state JSONB NOT NULL DEFAULT '{}'::jsonb,
+                    available_at TIMESTAMPTZ NOT NULL DEFAULT CURRENT_TIMESTAMP,
                     error TEXT,
                     started_at TIMESTAMPTZ,
                     finished_at TIMESTAMPTZ,
@@ -204,6 +206,15 @@ class PostgresIndex:
             connection.execute(
                 "ALTER TABLE patchwork_sync_runs "
                 "ADD COLUMN IF NOT EXISTS attempt_count INTEGER NOT NULL DEFAULT 0"
+            )
+            connection.execute(
+                "ALTER TABLE patchwork_sync_runs "
+                "ADD COLUMN IF NOT EXISTS state JSONB NOT NULL DEFAULT '{}'::jsonb"
+            )
+            connection.execute(
+                "ALTER TABLE patchwork_sync_runs "
+                "ADD COLUMN IF NOT EXISTS available_at TIMESTAMPTZ NOT NULL "
+                "DEFAULT CURRENT_TIMESTAMP"
             )
             connection.execute(
                 """
@@ -696,11 +707,12 @@ class PostgresIndex:
         with self._connection() as connection:
             row = connection.execute(
                 """
-                INSERT INTO patchwork_sync_runs (id, repository_id, status, requested_pull_limit)
-                VALUES (%s, %s, 'queued', %s)
+                INSERT INTO patchwork_sync_runs (
+                    id, repository_id, status, requested_pull_limit, state
+                ) VALUES (%s, %s, 'queued', %s, %s)
                 RETURNING *
                 """,
-                (run_id, repository_id, requested_pull_limit),
+                (run_id, repository_id, requested_pull_limit, Jsonb(_initial_sync_state())),
             ).fetchone()
         return _sync_run_row(row)
 
@@ -716,7 +728,7 @@ class PostgresIndex:
                 WITH candidate AS (
                     SELECT id
                     FROM patchwork_sync_runs
-                    WHERE status = 'queued'
+                    WHERE (status = 'queued' AND available_at <= CURRENT_TIMESTAMP)
                        OR (
                            status = 'running'
                            AND started_at < CURRENT_TIMESTAMP - (%s * INTERVAL '1 second')
@@ -747,6 +759,8 @@ class PostgresIndex:
         pull_requests_seen: int | None = None,
         patch_cards_indexed: int | None = None,
         chunks_indexed: int | None = None,
+        state: dict[str, object] | None = None,
+        retry_after_seconds: int | None = None,
         error: str | None = None,
     ) -> dict[str, object]:
         started_at = "CURRENT_TIMESTAMP" if status == "running" else "started_at"
@@ -759,13 +773,28 @@ class PostgresIndex:
                     pull_requests_seen = COALESCE(%s, pull_requests_seen),
                     patch_cards_indexed = COALESCE(%s, patch_cards_indexed),
                     chunks_indexed = COALESCE(%s, chunks_indexed),
+                    state = COALESCE(%s, state),
+                    available_at = CASE
+                        WHEN %s IS NULL THEN CURRENT_TIMESTAMP
+                        ELSE CURRENT_TIMESTAMP + (%s * INTERVAL '1 second')
+                    END,
                     error = %s,
                     started_at = {started_at},
                     finished_at = {finished_at}
                 WHERE id = %s
                 RETURNING *
                 """,
-                (status, pull_requests_seen, patch_cards_indexed, chunks_indexed, error, run_id),
+                (
+                    status,
+                    pull_requests_seen,
+                    patch_cards_indexed,
+                    chunks_indexed,
+                    Jsonb(state) if state is not None else None,
+                    retry_after_seconds,
+                    retry_after_seconds,
+                    error,
+                    run_id,
+                ),
             ).fetchone()
         if not row:
             raise KeyError(f"Sync run not found: {run_id}")
@@ -994,10 +1023,21 @@ def _sync_run_row(row: dict[str, object]) -> dict[str, object]:
         "patch_cards_indexed": row["patch_cards_indexed"],
         "chunks_indexed": row["chunks_indexed"],
         "attempt_count": row["attempt_count"],
+        "state": row["state"],
         "error": row["error"],
         "created_at": _timestamp(row["created_at"]),
         "started_at": _timestamp(row["started_at"]),
         "finished_at": _timestamp(row["finished_at"]),
+    }
+
+
+def _initial_sync_state() -> dict[str, object]:
+    """State for a sync that can safely resume after a worker restart."""
+    return {
+        "phase": "discovering",
+        "next_page": 1,
+        "candidate_pull_numbers": [],
+        "next_candidate_index": 0,
     }
 
 

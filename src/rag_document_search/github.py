@@ -31,6 +31,17 @@ class GitHubError(RuntimeError):
     """A recoverable error from a GitHub API request or repository URL."""
 
 
+class GitHubRateLimited(GitHubError):
+    """GitHub asked Patchwork to pause before continuing a durable sync."""
+
+    def __init__(self, retry_after_seconds: int) -> None:
+        self.retry_after_seconds = max(30, retry_after_seconds)
+        super().__init__(
+            "GitHub rate-limited this sync. Patchwork will resume automatically after "
+            f"about {self.retry_after_seconds // 60 or 1} minute(s)."
+        )
+
+
 @dataclass(frozen=True, slots=True)
 class GitHubRepository:
     github_url: str
@@ -95,11 +106,14 @@ class GitHubClient:
         token: str | None = None,
         timeout: int = 45,
         graphql_url: str | None = None,
+        minimum_request_interval_seconds: float = 0.8,
     ) -> None:
         self.api_url = api_url.rstrip("/")
         self.token = token
         self.timeout = timeout
         self.graphql_url = (graphql_url or f"{self.api_url}/graphql").rstrip("/")
+        self.minimum_request_interval_seconds = max(0.0, minimum_request_interval_seconds)
+        self._next_request_at = 0.0
 
     def repository(self, github_url: str) -> GitHubRepository:
         owner, name = parse_github_repository_url(github_url)
@@ -128,8 +142,8 @@ class GitHubClient:
         self, repository: GitHubRepository, *, limit: int
     ) -> tuple[int, list[PatchCard]]:
         """Build repair-history cards from bug-labelled and repair-like merged PRs."""
-        if not 1 <= limit <= 300:
-            raise ValueError("Patchwork supports between 1 and 300 historical fixes per sync")
+        if not 1 <= limit <= 10_000:
+            raise ValueError("Patchwork supports between 1 and 10000 historical fixes per sync")
         all_pulls = self._closed_pull_history(repository)
         labelled_pulls = [
             pull for pull in all_pulls if _has_bug_label(pull) and pull.get("number")
@@ -138,21 +152,46 @@ class GitHubClient:
 
         cards: list[PatchCard] = []
         for summary in pulls:
-            pull_number = int(summary["number"])
-            pull = self._get(f"/repos/{repository.owner}/{repository.name}/pulls/{pull_number}")
-            if not pull.get("merged_at") or not _looks_like_bug_fix(pull):
-                continue
-            files = self._get(
-                f"/repos/{repository.owner}/{repository.name}/pulls/{pull_number}/files",
-                {"per_page": 100},
-            )
-            if not isinstance(files, list):
-                raise GitHubError(
-                    f"GitHub returned invalid file data for pull request #{pull_number}"
-                )
-            linked_issue = self._linked_issue(repository, pull)
-            cards.append(_patch_card(repository, pull, files, linked_issue))
+            card = self.patch_card(repository, int(summary["number"]))
+            if card:
+                cards.append(card)
         return len(all_pulls), cards
+
+    def closed_pull_page(
+        self, repository: GitHubRepository, *, page: int
+    ) -> list[dict[str, Any]]:
+        """Return one stable, 100-PR page of a repository's closed history."""
+        if not 1 <= page <= 100:
+            raise ValueError("Patchwork supports up to 10,000 closed pull requests per sync")
+        pulls = self._get(
+            f"/repos/{repository.owner}/{repository.name}/pulls",
+            {
+                "state": "closed",
+                "sort": "updated",
+                "direction": "desc",
+                "per_page": 100,
+                "page": page,
+            },
+        )
+        if not isinstance(pulls, list):
+            raise GitHubError("GitHub returned an unexpected pull-request listing")
+        return [pull for pull in pulls if isinstance(pull, dict)]
+
+    def patch_card(
+        self, repository: GitHubRepository, pull_number: int
+    ) -> PatchCard | None:
+        """Fetch one candidate's evidence, intended for a durable worker batch."""
+        pull = self._get(f"/repos/{repository.owner}/{repository.name}/pulls/{pull_number}")
+        if not isinstance(pull, dict) or not pull.get("merged_at") or not _looks_like_bug_fix(pull):
+            return None
+        files = self._get(
+            f"/repos/{repository.owner}/{repository.name}/pulls/{pull_number}/files",
+            {"per_page": 100},
+        )
+        if not isinstance(files, list):
+            raise GitHubError(f"GitHub returned invalid file data for pull request #{pull_number}")
+        linked_issue = self._linked_issue(repository, pull)
+        return _patch_card(repository, pull, files, linked_issue)
 
     def _closed_pull_history(self, repository: GitHubRepository) -> list[dict[str, Any]]:
         """Read all closed PR summaries without fetching every diff up front.
@@ -163,19 +202,8 @@ class GitHubClient:
         """
         history: list[dict[str, Any]] = []
         for page in range(1, 101):  # 10,000 PRs: a deliberate, bounded ceiling.
-            pulls = self._get(
-                f"/repos/{repository.owner}/{repository.name}/pulls",
-                {
-                    "state": "closed",
-                    "sort": "updated",
-                    "direction": "desc",
-                    "per_page": 100,
-                    "page": page,
-                },
-            )
-            if not isinstance(pulls, list):
-                raise GitHubError("GitHub returned an unexpected pull-request listing")
-            history.extend(pull for pull in pulls if isinstance(pull, dict))
+            pulls = self.closed_pull_page(repository, page=page)
+            history.extend(pulls)
             if len(pulls) < 100:
                 break
         return history
@@ -258,15 +286,14 @@ class GitHubClient:
         retryable_error: GitHubError | None = None
         for attempt in range(2):
             try:
+                self._wait_for_request_slot()
                 with urllib.request.urlopen(request, timeout=self.timeout) as response:
+                    self._record_request_slot()
                     return json.loads(response.read().decode("utf-8"))
             except urllib.error.HTTPError as error:
                 detail = error.read().decode("utf-8", errors="replace")[:350]
                 if error.code in {403, 429}:
-                    raise GitHubError(
-                        "GitHub rate-limited this sync. Link a GitHub account or set "
-                        "PATCHWORK_GITHUB_TOKEN and retry."
-                    ) from error
+                    raise GitHubRateLimited(_retry_after_seconds(error.headers)) from error
                 if error.code == 404:
                     raise GitHubError(
                         "GitHub could not find this repository. If it is private, link your "
@@ -293,10 +320,14 @@ class GitHubClient:
             method="POST",
         )
         try:
+            self._wait_for_request_slot()
             with urllib.request.urlopen(request, timeout=self.timeout) as response:
+                self._record_request_slot()
                 return json.loads(response.read().decode("utf-8"))
         except urllib.error.HTTPError as error:
             detail = error.read().decode("utf-8", errors="replace")[:350]
+            if error.code in {403, 429}:
+                raise GitHubRateLimited(_retry_after_seconds(error.headers)) from error
             raise GitHubError(f"GitHub returned HTTP {error.code}: {detail}") from error
         except (TimeoutError, urllib.error.URLError) as error:
             raise GitHubError("GitHub did not respond before the request timeout") from error
@@ -310,6 +341,14 @@ class GitHubClient:
         if self.token:
             headers["Authorization"] = f"Bearer {self.token}"
         return headers
+
+    def _wait_for_request_slot(self) -> None:
+        delay = self._next_request_at - time.monotonic()
+        if delay > 0:
+            time.sleep(delay)
+
+    def _record_request_slot(self) -> None:
+        self._next_request_at = time.monotonic() + self.minimum_request_interval_seconds
 
 
 def _looks_like_bug_fix(pull: dict[str, Any]) -> bool:
@@ -332,6 +371,21 @@ def _has_bug_label(pull: dict[str, Any]) -> bool:
         for label in pull.get("labels", [])
         if isinstance(label, dict)
     )
+
+
+def is_repair_candidate(pull: dict[str, Any]) -> bool:
+    """Use labels and repair language to keep unrelated feature PRs out of the RAG corpus."""
+    return bool(pull.get("number")) and (_has_bug_label(pull) or _looks_like_bug_fix(pull))
+
+
+def _retry_after_seconds(headers: Any) -> int:
+    retry_after = headers.get("Retry-After") if headers else None
+    if retry_after and str(retry_after).isdigit():
+        return int(retry_after) + 5
+    reset = headers.get("X-RateLimit-Reset") if headers else None
+    if reset and str(reset).isdigit():
+        return max(30, int(reset) - int(time.time()) + 5)
+    return 60
 
 
 def _balanced_repair_candidates(

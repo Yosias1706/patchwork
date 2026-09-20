@@ -60,9 +60,9 @@ class Settings:
         if llm_provider not in {"extractive", "openai_compatible"}:
             raise ValueError(f"Unsupported RAG_LLM_PROVIDER: {llm_provider}")
 
-        patchwork_default_pull_limit = _positive_int("PATCHWORK_DEFAULT_PULL_LIMIT", 300)
-        if patchwork_default_pull_limit > 300:
-            raise ValueError("PATCHWORK_DEFAULT_PULL_LIMIT must be at most 300")
+        patchwork_default_pull_limit = _positive_int("PATCHWORK_DEFAULT_PULL_LIMIT", 10_000)
+        if patchwork_default_pull_limit > 10_000:
+            raise ValueError("PATCHWORK_DEFAULT_PULL_LIMIT must be at most 10000")
 
         # Render provides its public URL at runtime. Explicit Patchwork settings
         # still win, which keeps custom-domain and local deployments predictable.

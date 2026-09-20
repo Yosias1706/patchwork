@@ -6,13 +6,24 @@ import re
 from dataclasses import asdict
 from typing import Any
 
-from .github import GitHubClient, GitHubError, GitHubRepository, PatchCard
+from .github import (
+    GitHubClient,
+    GitHubError,
+    GitHubRateLimited,
+    GitHubRepository,
+    PatchCard,
+    is_repair_candidate,
+)
 from .github_oauth import GitHubOAuthService
 from .investigator import InvestigationAgent
 from .models import SourceDocument
 from .repository import PostgresIndex
 from .service import RAGService
 from .solution_agent import SolutionAgent, build_solution_generator
+
+_DISCOVERY_PAGES_PER_BATCH = 10
+_DETAIL_PULLS_PER_BATCH = 10
+_MAX_HISTORY_PAGES = 100
 
 
 class PatchworkService:
@@ -45,7 +56,8 @@ class PatchworkService:
         run = self.index.get_patchwork_sync_run(run_id)
         if not run:
             raise KeyError(f"Sync run not found: {run_id}")
-        self.index.update_patchwork_sync_run(run_id, status="running")
+        state = _sync_state(run.get("state"))
+        self.index.update_patchwork_sync_run(run_id, status="running", state=state)
         try:
             owner_user_id = self.index.get_patchwork_repository_owner(repository_id)
             if not owner_user_id:
@@ -59,26 +71,124 @@ class PatchworkService:
                 description=_string_or_none(repository["description"]),
                 is_private=bool(repository["is_private"]),
             )
-            seen, cards = self._github_client(owner_user_id).patch_cards(
-                github_repository, limit=int(run["requested_pull_limit"])
-            )
-            report = self.rag.ingest_documents(
-                _repository_documents(card.document, repository_id) for card in cards
-            )
-            self.index.replace_patchwork_evaluation_cases(
-                repository_id, _evaluation_manifest(cards, repository_id)
-            )
-            failures = "; ".join(report.failures) if report.failures else None
+            client = self._github_client(owner_user_id)
+            if state["phase"] == "discovering":
+                self._discover_repair_candidates(run_id, github_repository, run, state, client)
+            else:
+                self._index_repair_candidates(
+                    run_id, repository_id, github_repository, run, state, client
+                )
+        except GitHubRateLimited as error:
             self.index.update_patchwork_sync_run(
                 run_id,
-                status="completed",
-                pull_requests_seen=seen,
-                patch_cards_indexed=report.documents_indexed + report.documents_unchanged,
-                chunks_indexed=report.chunks_indexed,
-                error=failures,
+                status="queued",
+                state=state,
+                retry_after_seconds=error.retry_after_seconds,
+                error=str(error),
             )
         except (GitHubError, OSError, RuntimeError, ValueError) as error:
             self.index.update_patchwork_sync_run(run_id, status="failed", error=str(error))
+
+    def _discover_repair_candidates(
+        self,
+        run_id: str,
+        repository: GitHubRepository,
+        run: dict[str, object],
+        state: dict[str, object],
+        client: GitHubClient,
+    ) -> None:
+        """Checkpoint closed-PR discovery page by page before requesting any diff."""
+        candidates = state["candidate_pull_numbers"]
+        known = set(candidates)
+        seen = int(run["pull_requests_seen"])
+        for _ in range(_DISCOVERY_PAGES_PER_BATCH):
+            page = int(state["next_page"])
+            pulls = client.closed_pull_page(repository, page=page)
+            seen += len(pulls)
+            for pull in pulls:
+                number = int(pull["number"])
+                if (
+                    number not in known
+                    and len(candidates) < int(run["requested_pull_limit"])
+                    and is_repair_candidate(pull)
+                ):
+                    candidates.append(number)
+                    known.add(number)
+            state["next_page"] = page + 1
+            if len(pulls) < 100 or page == _MAX_HISTORY_PAGES:
+                state["phase"] = "indexing"
+            self.index.update_patchwork_sync_run(
+                run_id,
+                status="running",
+                state=state,
+                pull_requests_seen=seen,
+            )
+            if state["phase"] == "indexing":
+                break
+
+        self.index.update_patchwork_sync_run(
+            run_id,
+            status="queued",
+            state=state,
+            pull_requests_seen=seen,
+            error=None,
+        )
+
+    def _index_repair_candidates(
+        self,
+        run_id: str,
+        repository_id: str,
+        repository: GitHubRepository,
+        run: dict[str, object],
+        state: dict[str, object],
+        client: GitHubClient,
+    ) -> None:
+        """Index a bounded set of candidate fixes and checkpoint each completed PR."""
+        candidates = state["candidate_pull_numbers"]
+        offset = int(state["next_candidate_index"])
+        documents = int(run["patch_cards_indexed"])
+        chunks = int(run["chunks_indexed"])
+        stop = min(offset + _DETAIL_PULLS_PER_BATCH, len(candidates))
+        for candidate_index in range(offset, stop):
+            card = client.patch_card(repository, candidates[candidate_index])
+            if card:
+                report = self.rag.ingest_documents(
+                    [_repository_documents(card.document, repository_id)]
+                )
+                documents += report.documents_indexed + report.documents_unchanged
+                chunks += report.chunks_indexed
+            state["next_candidate_index"] = candidate_index + 1
+            self.index.update_patchwork_sync_run(
+                run_id,
+                status="running",
+                state=state,
+                patch_cards_indexed=documents,
+                chunks_indexed=chunks,
+            )
+
+        if int(state["next_candidate_index"]) < len(candidates):
+            self.index.update_patchwork_sync_run(
+                run_id,
+                status="queued",
+                state=state,
+                patch_cards_indexed=documents,
+                chunks_indexed=chunks,
+                error=None,
+            )
+            return
+
+        documents_for_repository = self.index.list_documents_for_repository(repository_id)
+        self.index.replace_patchwork_evaluation_cases(
+            repository_id, _evaluation_manifest_from_documents(documents_for_repository)
+        )
+        self.index.update_patchwork_sync_run(
+            run_id,
+            status="completed",
+            state=state,
+            patch_cards_indexed=documents,
+            chunks_indexed=chunks,
+            error=None,
+        )
 
     def repository(self, repository_id: str, *, user_id: str) -> dict[str, object] | None:
         repository = self.index.get_patchwork_repository(repository_id, user_id=user_id)
@@ -300,6 +410,57 @@ def _evaluation_manifest(cards: list[PatchCard], repository_id: str) -> list[dic
             }
         )
     return cases
+
+
+def _evaluation_manifest_from_documents(
+    documents: list[dict[str, object]],
+) -> list[dict[str, object]]:
+    """Rebuild the final evaluation manifest after a resumable multi-batch sync."""
+    cases: list[dict[str, object]] = []
+    for document in documents:
+        metadata = document.get("metadata")
+        if not isinstance(metadata, dict):
+            continue
+        query = metadata.get("benchmark_query")
+        provenance = metadata.get("benchmark_provenance")
+        pull_number = metadata.get("pull_number")
+        source = document.get("source")
+        if not (
+            isinstance(query, str)
+            and query.strip()
+            and isinstance(provenance, str)
+            and isinstance(pull_number, int)
+            and isinstance(source, str)
+        ):
+            continue
+        cases.append(
+            {
+                "expected_source": source,
+                "expected_pull_number": pull_number,
+                "query": query.strip(),
+                "provenance": provenance,
+                "issue_number": metadata.get("linked_issue_number"),
+                "issue_url": metadata.get("linked_issue_url"),
+            }
+        )
+    return cases
+
+
+def _sync_state(raw_state: object) -> dict[str, object]:
+    """Normalize state from newly-created and pre-batching sync rows."""
+    raw = raw_state if isinstance(raw_state, dict) else {}
+    phase = raw.get("phase") if raw.get("phase") in {"discovering", "indexing"} else "discovering"
+    candidates = [
+        int(number)
+        for number in raw.get("candidate_pull_numbers", [])
+        if isinstance(number, int) or (isinstance(number, str) and number.isdigit())
+    ]
+    return {
+        "phase": phase,
+        "next_page": max(1, int(raw.get("next_page", 1))),
+        "candidate_pull_numbers": list(dict.fromkeys(candidates)),
+        "next_candidate_index": max(0, int(raw.get("next_candidate_index", 0))),
+    }
 
 
 def _evaluation_note(verified_cases: int, smoke_test_cases: int) -> str:
