@@ -68,7 +68,7 @@ class SearchRequest(BaseModel):
 
 class RepositoryConnectRequest(BaseModel):
     github_url: str = Field(description="GitHub repository URL, for example https://github.com/fastapi/fastapi")
-    pull_limit: int | None = Field(default=None, ge=1, le=30)
+    pull_limit: int | None = Field(default=None, ge=1, le=300)
 
 
 class InvestigateRequest(BaseModel):
@@ -80,7 +80,7 @@ class InvestigateRequest(BaseModel):
 
 
 class RepositorySyncRequest(BaseModel):
-    pull_limit: int | None = Field(default=None, ge=1, le=30)
+    pull_limit: int | None = Field(default=None, ge=1, le=300)
 
 
 class CredentialsRequest(BaseModel):

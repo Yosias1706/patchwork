@@ -128,32 +128,13 @@ class GitHubClient:
         self, repository: GitHubRepository, *, limit: int
     ) -> tuple[int, list[PatchCard]]:
         """Build repair-history cards from bug-labelled and repair-like merged PRs."""
-        if not 1 <= limit <= 30:
-            raise ValueError("Patchwork supports between 1 and 30 pull requests per sync")
-        labelled_issues = self._get(
-            f"/repos/{repository.owner}/{repository.name}/issues",
-            {
-                "state": "closed",
-                "labels": "bug",
-                "sort": "updated",
-                "direction": "desc",
-                "per_page": limit,
-            },
-        )
-        if not isinstance(labelled_issues, list):
-            raise GitHubError("GitHub returned an unexpected issue listing")
-
-        scan_limit = min(max(limit * 3, 30), 100)
-        recent_pulls = self._get(
-            f"/repos/{repository.owner}/{repository.name}/pulls",
-            {"state": "closed", "sort": "updated", "direction": "desc", "per_page": scan_limit},
-        )
-        if not isinstance(recent_pulls, list):
-            raise GitHubError("GitHub returned an unexpected pull-request listing")
+        if not 1 <= limit <= 300:
+            raise ValueError("Patchwork supports between 1 and 300 historical fixes per sync")
+        all_pulls = self._closed_pull_history(repository)
         labelled_pulls = [
-            candidate for candidate in labelled_issues if candidate.get("pull_request")
+            pull for pull in all_pulls if _has_bug_label(pull) and pull.get("number")
         ]
-        pulls = _balanced_repair_candidates(labelled_pulls, recent_pulls, limit)
+        pulls = _balanced_repair_candidates(labelled_pulls, all_pulls, limit)
 
         cards: list[PatchCard] = []
         for summary in pulls:
@@ -171,7 +152,33 @@ class GitHubClient:
                 )
             linked_issue = self._linked_issue(repository, pull)
             cards.append(_patch_card(repository, pull, files, linked_issue))
-        return len(labelled_pulls) + len(recent_pulls), cards
+        return len(all_pulls), cards
+
+    def _closed_pull_history(self, repository: GitHubRepository) -> list[dict[str, Any]]:
+        """Read all closed PR summaries without fetching every diff up front.
+
+        GitHub serves up to 100 pull-request summaries per page. Detailed PR and
+        file calls are reserved for the selected repair candidates, keeping a
+        complete history scan practical for large repositories.
+        """
+        history: list[dict[str, Any]] = []
+        for page in range(1, 101):  # 10,000 PRs: a deliberate, bounded ceiling.
+            pulls = self._get(
+                f"/repos/{repository.owner}/{repository.name}/pulls",
+                {
+                    "state": "closed",
+                    "sort": "updated",
+                    "direction": "desc",
+                    "per_page": 100,
+                    "page": page,
+                },
+            )
+            if not isinstance(pulls, list):
+                raise GitHubError("GitHub returned an unexpected pull-request listing")
+            history.extend(pull for pull in pulls if isinstance(pull, dict))
+            if len(pulls) < 100:
+                break
+        return history
 
     def _linked_issue(
         self, repository: GitHubRepository, pull: dict[str, Any]
@@ -316,6 +323,14 @@ def _looks_like_bug_fix(pull: dict[str, Any]) -> bool:
     )
     return bool(_REPAIR_WORDS.search(candidate_text)) or bool(
         _CLOSING_ISSUE.search(_optional_text(pull.get("body")) or "")
+    )
+
+
+def _has_bug_label(pull: dict[str, Any]) -> bool:
+    return any(
+        str(label.get("name", "")).strip().lower() == "bug"
+        for label in pull.get("labels", [])
+        if isinstance(label, dict)
     )
 
 

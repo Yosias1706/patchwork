@@ -61,8 +61,8 @@ class Settings:
             raise ValueError(f"Unsupported RAG_LLM_PROVIDER: {llm_provider}")
 
         patchwork_default_pull_limit = _positive_int("PATCHWORK_DEFAULT_PULL_LIMIT", 15)
-        if patchwork_default_pull_limit > 30:
-            raise ValueError("PATCHWORK_DEFAULT_PULL_LIMIT must be at most 30")
+        if patchwork_default_pull_limit > 300:
+            raise ValueError("PATCHWORK_DEFAULT_PULL_LIMIT must be at most 300")
 
         # Render provides its public URL at runtime. Explicit Patchwork settings
         # still win, which keeps custom-domain and local deployments predictable.

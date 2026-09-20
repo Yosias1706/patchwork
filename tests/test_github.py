@@ -92,6 +92,30 @@ def test_repair_selection_keeps_untagged_repair_history() -> None:
     assert [pull["number"] for pull in selected] == [1, 2]
 
 
+def test_closed_pull_history_paginates_until_the_last_page(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    client = GitHubClient("https://api.github.com")
+    repository = GitHubRepository(
+        github_url="https://github.com/example/api", full_name="example/api", owner="example",
+        name="api", default_branch="main", description=None, is_private=False,
+    )
+    first_page = [{"number": number} for number in range(1, 101)]
+    requests: list[int] = []
+
+    def get_history(_path: str, query: dict[str, object] | None = None) -> list[dict[str, int]]:
+        page = int((query or {})["page"])
+        requests.append(page)
+        return first_page if page == 1 else [{"number": 101}]
+
+    monkeypatch.setattr(client, "_get", get_history)
+
+    history = client._closed_pull_history(repository)
+
+    assert len(history) == 101
+    assert requests == [1, 2]
+
+
 def test_github_timeout_becomes_a_recoverable_error(monkeypatch: pytest.MonkeyPatch) -> None:
     def timed_out(*_args: object, **_kwargs: object) -> object:
         raise TimeoutError("network stalled")
