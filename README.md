@@ -198,7 +198,7 @@ Copy `.env.example` to `.env`. Environment variables take precedence.
 | --- | --- | --- |
 | `RAG_DATABASE_URL` | `postgresql://rag:rag@localhost:5432/rag_document_search` | PostgreSQL connection string. |
 | `PATCHWORK_GITHUB_TOKEN` | unset | Fine-grained token for higher GitHub limits or private-repository read access. Keep it out of source control. |
-| `PATCHWORK_GITHUB_OAUTH_CLIENT_ID` | unset | GitHub OAuth App client ID; enables the optional per-account authorization flow. |
+| `PATCHWORK_GITHUB_OAUTH_CLIENT_ID` | unset | GitHub OAuth App client ID; enables account linking and authenticates public history scans with the app's 5,000-requests/hour pool when no user token is linked. |
 | `PATCHWORK_GITHUB_OAUTH_CLIENT_SECRET` | unset | GitHub OAuth App client secret. Store only in deployment secrets. |
 | `PATCHWORK_GITHUB_OAUTH_REDIRECT_URL` | unset | Exact GitHub OAuth callback URL: `/auth/github/callback`. |
 | `PATCHWORK_TOKEN_ENCRYPTION_KEY` | unset | Stable Fernet key for encrypting stored GitHub access/refresh tokens. |

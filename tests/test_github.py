@@ -125,3 +125,13 @@ def test_github_timeout_becomes_a_recoverable_error(monkeypatch: pytest.MonkeyPa
 
     with pytest.raises(GitHubError, match="did not respond"):
         GitHubClient("https://api.github.com", timeout=1)._get("/repos/example/api")
+
+
+def test_public_client_uses_server_side_oauth_credentials_when_no_user_token_exists() -> None:
+    headers = GitHubClient(
+        "https://api.github.com",
+        oauth_client_id="client",
+        oauth_client_secret="secret",
+    )._headers()
+
+    assert headers["Authorization"] == "Basic Y2xpZW50OnNlY3JldA=="

@@ -341,6 +341,8 @@ class PatchworkService:
             token=account_token or self.rag.settings.github_token,
             timeout=self.rag.settings.request_timeout_seconds,
             graphql_url=self.rag.settings.github_graphql_url,
+            oauth_client_id=self.rag.settings.github_oauth_client_id,
+            oauth_client_secret=self.rag.settings.github_oauth_client_secret,
         )
 
 

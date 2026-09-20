@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import base64
 import hashlib
 import json
 import re
@@ -107,6 +108,8 @@ class GitHubClient:
         timeout: int = 45,
         graphql_url: str | None = None,
         minimum_request_interval_seconds: float = 0.8,
+        oauth_client_id: str | None = None,
+        oauth_client_secret: str | None = None,
     ) -> None:
         self.api_url = api_url.rstrip("/")
         self.token = token
@@ -114,6 +117,8 @@ class GitHubClient:
         self.graphql_url = (graphql_url or f"{self.api_url}/graphql").rstrip("/")
         self.minimum_request_interval_seconds = max(0.0, minimum_request_interval_seconds)
         self._next_request_at = 0.0
+        self.oauth_client_id = oauth_client_id
+        self.oauth_client_secret = oauth_client_secret
 
     def repository(self, github_url: str) -> GitHubRepository:
         owner, name = parse_github_repository_url(github_url)
@@ -340,6 +345,9 @@ class GitHubClient:
         }
         if self.token:
             headers["Authorization"] = f"Bearer {self.token}"
+        elif self.oauth_client_id and self.oauth_client_secret:
+            credentials = f"{self.oauth_client_id}:{self.oauth_client_secret}".encode()
+            headers["Authorization"] = f"Basic {base64.b64encode(credentials).decode('ascii')}"
         return headers
 
     def _wait_for_request_slot(self) -> None:
