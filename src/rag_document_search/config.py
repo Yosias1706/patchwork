@@ -60,7 +60,7 @@ class Settings:
         if llm_provider not in {"extractive", "openai_compatible"}:
             raise ValueError(f"Unsupported RAG_LLM_PROVIDER: {llm_provider}")
 
-        patchwork_default_pull_limit = _positive_int("PATCHWORK_DEFAULT_PULL_LIMIT", 15)
+        patchwork_default_pull_limit = _positive_int("PATCHWORK_DEFAULT_PULL_LIMIT", 300)
         if patchwork_default_pull_limit > 300:
             raise ValueError("PATCHWORK_DEFAULT_PULL_LIMIT must be at most 300")
 
