@@ -90,10 +90,11 @@ class RAGService:
         query = query.strip()
         if not query:
             raise ValueError("Query must not be empty")
+        if limit is not None and limit <= 0:
+            raise ValueError("Query limit must be positive")
         vectors = self.embedder.embed([query])
-        return self.index.search(
-            vectors[0], limit or self.settings.top_k, repository_id=repository_id
-        )
+        search_limit = self.settings.top_k if limit is None else limit
+        return self.index.search(vectors[0], search_limit, repository_id=repository_id)
 
     def ask(
         self,

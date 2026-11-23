@@ -29,10 +29,18 @@ def _parser() -> argparse.ArgumentParser:
     connect = commands.add_parser("connect", help="Connect and synchronously index a repository")
     connect.add_argument("github_url", help="GitHub.com repository URL")
     connect.add_argument("--pull-limit", type=int, default=None)
+    connect.add_argument(
+        "--ingestion-mode", choices=("detailed", "bulk"), default="detailed",
+        help="Detailed repair candidates, or fast merged-PR summaries with details on demand",
+    )
 
     sync = commands.add_parser("sync", help="Synchronously refresh a repository's patch cards")
     sync.add_argument("repository_id")
     sync.add_argument("--pull-limit", type=int, default=None)
+    sync.add_argument(
+        "--ingestion-mode", choices=("detailed", "bulk"), default="detailed",
+        help="Detailed repair candidates, or fast merged-PR summaries with details on demand",
+    )
 
     commands.add_parser("repositories", help="List connected repositories and latest run state")
 
@@ -97,7 +105,8 @@ def main() -> None:
         user_id = str(user["id"]) if user else ""
         if args.command == "connect":
             repository, run = patchwork.connect_repository(
-                args.github_url, user_id=user_id, pull_limit=args.pull_limit
+                args.github_url, user_id=user_id, pull_limit=args.pull_limit,
+                ingestion_mode=args.ingestion_mode,
             )
             patchwork.sync_repository(str(repository["id"]), str(run["id"]))
             _print_json(
@@ -111,7 +120,8 @@ def main() -> None:
             if not existing:
                 raise KeyError(f"Repository not found: {args.repository_id}")
             repository, run = patchwork.connect_repository(
-                str(existing["github_url"]), user_id=user_id, pull_limit=args.pull_limit
+                str(existing["github_url"]), user_id=user_id, pull_limit=args.pull_limit,
+                ingestion_mode=args.ingestion_mode,
             )
             patchwork.sync_repository(str(repository["id"]), str(run["id"]))
             _print_json(patchwork.index.get_patchwork_sync_run(str(run["id"])))

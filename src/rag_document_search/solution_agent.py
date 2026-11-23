@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import json
+import re
 from collections.abc import Sequence
 from dataclasses import asdict, dataclass
 
@@ -20,6 +21,7 @@ class RecommendedSolution:
     code_guidance: str | None
     verification: tuple[str, ...]
     cautions: tuple[str, ...]
+    why_this_matches: tuple[str, ...]
     source_pull_numbers: tuple[int, ...]
     mode: str
 
@@ -49,7 +51,7 @@ class SolutionAgent:
         fallback = _evidence_guided_solution(issue, evidence)
         try:
             return self.generator.propose(issue, evidence, fallback)
-        except (RuntimeError, ValueError, KeyError, TypeError):
+        except (OSError, RuntimeError, ValueError, KeyError, TypeError):
             # A temporary model failure must never make a completed retrieval
             # unusable. The UI explicitly identifies this fallback mode.
             return fallback
@@ -97,6 +99,7 @@ class OpenAICompatibleSolutionGenerator(SolutionGenerator):
                         "You are Patchwork's implementation advisor. Use only the supplied "
                         "repository evidence. Return JSON with assessment, implementation_steps, "
                         "code_guidance, verification, and cautions. Keep every field concise. "
+                        "Do not claim that the historical fix is proven to solve the new report. "
                         "A code_guidance value may be a small illustrative sketch, but it must not "
                         "invent APIs, paths, or behavior not supported by the evidence. "
                         "If evidence is incomplete, set code_guidance to null and state the "
@@ -130,6 +133,7 @@ class OpenAICompatibleSolutionGenerator(SolutionGenerator):
             code_guidance=_optional_text(parsed.get("code_guidance"), 1800),
             verification=_text_list(parsed.get("verification"), fallback.verification, 4),
             cautions=_text_list(parsed.get("cautions"), fallback.cautions, 3),
+            why_this_matches=fallback.why_this_matches,
             source_pull_numbers=fallback.source_pull_numbers,
             mode="model_assisted",
         )
@@ -147,18 +151,20 @@ def _evidence(
     by_pull_url = {str(match.get("pull_url")): match for match in matches}
     entries: list[dict[str, object]] = []
     for hit in citations:
-        match = by_pull_url.get(hit.source)
-        if not match or any(entry["pull_url"] == hit.source for entry in entries):
+        pull_url = str(hit.metadata.get("pull_url") or hit.source)
+        match = by_pull_url.get(pull_url)
+        if not match or any(entry["pull_url"] == pull_url for entry in entries):
             continue
         entries.append(
             {
                 "pull_number": match.get("pull_number"),
-                "pull_url": hit.source,
+                "pull_url": pull_url,
                 "title": str(match.get("title") or "Historical fix"),
                 "excerpt": str(match.get("excerpt") or ""),
                 "changed_files": [str(path) for path in match.get("changed_files", [])[:5]],
                 "test_files": [str(path) for path in match.get("test_files", [])[:3]],
-                "context": hit.text[:1800],
+                "match_reasons": [str(reason) for reason in match.get("match_reasons", [])[:4]],
+                "context": hit.text[:12000],
             }
         )
         if len(entries) == 3:
@@ -182,6 +188,7 @@ def _evidence_guided_solution(
             code_guidance=None,
             verification=(),
             cautions=("Do not infer a fix from unrelated repository changes.",),
+            why_this_matches=(),
             source_pull_numbers=(),
             mode="evidence_guided",
         )
@@ -190,9 +197,25 @@ def _evidence_guided_solution(
     pull_number = lead.get("pull_number")
     files = [str(path) for path in lead.get("changed_files", [])]
     tests = [str(path) for path in lead.get("test_files", [])]
+    reasons = tuple(str(reason) for reason in lead.get("match_reasons", [])[:4])
     inspection_target = ", ".join(files[:3]) or "the files changed by the reference PR"
+    title = re.sub(r"^PR #\d+\s*·\s*", "", str(lead.get("title") or "Historical fix"))
+    excerpt = str(lead.get("excerpt") or "").strip()
+    historical_change = _historical_diff(str(lead.get("context") or ""))
+    symbols = re.findall(
+        r"^\+\s*(?:async\s+)?(?:def|class|function)\s+([A-Za-z_][A-Za-z0-9_]*)",
+        str(lead.get("context") or ""),
+        re.M,
+    )
+    mechanism = (
+        "The recorded diff introduces " + ", ".join(dict.fromkeys(symbols[:3])) + ". "
+        if symbols
+        else ""
+    )
+    report = " ".join(issue.split())[:240]
     steps = [
-        f"Compare the reported behavior with PR #{pull_number} and inspect {inspection_target}.",
+        f"Reproduce the reported behavior: {report}",
+        f"Inspect {inspection_target} against the changes in PR #{pull_number}: {title}.",
         (
             "Apply the same narrow control-flow or validation pattern only where the current "
             "code has the matching failure mode."
@@ -205,11 +228,13 @@ def _evidence_guided_solution(
     )
     return RecommendedSolution(
         assessment=(
-            f"PR #{pull_number} is the closest available implementation reference for this report. "
-            "Use it as a pattern to verify, not as a patch to copy blindly."
+            f"PR #{pull_number} ({title}) provides a historical reference. "
+            f"{excerpt} {mechanism}"
+            f"For this report, inspect {inspection_target} and check whether the same failure "
+            "occurs in the current code before adapting that change."
         ),
         implementation_steps=tuple(steps),
-        code_guidance=None,
+        code_guidance=historical_change,
         verification=tuple(
             [f"Run or extend the regression coverage in {path}." for path in tests[:2]]
             or [
@@ -221,9 +246,21 @@ def _evidence_guided_solution(
             "Repository history is evidence, not proof that the current code has the same root "
             "cause.",
         ),
+        why_this_matches=reasons,
         source_pull_numbers=source_numbers,
         mode="evidence_guided",
     )
+
+
+def _historical_diff(context: str) -> str | None:
+    """Quote a bounded source diff rather than inventing an implementation."""
+    for match in re.finditer(r"```diff\n(.*?)```", context, re.S):
+        lines = match.group(1).strip().splitlines()
+        if any(line.startswith(("+", "-")) for line in lines):
+            return (
+                "Historical PR diff (verify against current code):\n" + "\n".join(lines[:24])[:1600]
+            )
+    return None
 
 
 def _text(value: object, fallback: str, maximum: int) -> str:

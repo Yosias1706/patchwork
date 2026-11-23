@@ -25,6 +25,7 @@ import {
 import { FormEvent, ReactNode, useEffect, useMemo, useState } from "react";
 
 type View = "investigate" | "repositories" | "evaluation";
+type IngestionMode = "detailed" | "bulk";
 
 type SyncRun = {
   id: string;
@@ -35,6 +36,23 @@ type SyncRun = {
   error: string | null;
   created_at: string;
   finished_at: string | null;
+  available_at?: string | null;
+  progress?: {
+    phase?: "discovering" | "indexing" | "bulk";
+    ingestion_mode?: IngestionMode;
+    candidates_discovered?: number;
+    candidates_processed?: number;
+  } | null;
+};
+
+type EvaluationCaseResult = {
+  expected_pull_number?: number;
+  expected_pull_url?: string | null;
+  issue_url?: string | null;
+  query: string;
+  rank: number | null;
+  source_kind: string;
+  retrieved: { pull_number: number; pull_url: string; title?: string }[];
 };
 
 type EvaluationRun = {
@@ -45,8 +63,13 @@ type EvaluationRun = {
     recall_at_1?: number | null;
     recall_at_3?: number | null;
     mrr?: number | null;
-    quality?: "verified_issue_to_fix" | "smoke_test";
-    case_breakdown?: { verified_issue_to_fix: number; pr_description_smoke_test: number };
+    quality?: "verified_issue_to_fix" | "user_labeled_issue_to_fix" | "smoke_test";
+    case_breakdown?: { verified_issue_to_fix: number; user_labeled_issue?: number; pr_description_smoke_test: number };
+    case_results?: EvaluationCaseResult[];
+    indexed_fixes?: number;
+    available_cases?: number;
+    duration_seconds?: number;
+    recommendations?: string[];
     failure_samples?: {
       expected_pull_number?: number;
       issue_url?: string | null;
@@ -74,10 +97,13 @@ type Repository = {
 };
 
 type PatchMatch = {
+  evidence_level?: "summary" | "full";
   pull_number: number | null;
   pull_url: string;
   title: string;
   score: number;
+  match_reasons: string[];
+  matched_terms: string[];
   merge_commit_sha: string | null;
   linked_issue_number?: number | null;
   linked_issue_url?: string | null;
@@ -93,6 +119,7 @@ type RecommendedSolution = {
   code_guidance: string | null;
   verification: string[];
   cautions: string[];
+  why_this_matches: string[];
   source_pull_numbers: number[];
   mode: "model_assisted" | "evidence_guided";
 };
@@ -103,6 +130,7 @@ type Investigation = {
   matches: PatchMatch[];
   confidence: "high" | "moderate" | "low" | "no_similar_fix_found";
   recommended_solution?: RecommendedSolution;
+  warnings?: string[];
 };
 
 type User = {
@@ -173,6 +201,32 @@ function isWorking(status?: string) {
 function statusText(status?: string) {
   if (!status) return "Not indexed";
   return status[0].toUpperCase() + status.slice(1);
+}
+
+function syncProgressText(run?: SyncRun | null) {
+  if (!run) return "Not indexed";
+  if (run.status === "queued" && /rate.limit/i.test(run.error ?? "")) return "Waiting for GitHub";
+  if (run.status === "running" && run.progress?.phase === "discovering") {
+    return `Reviewing history · ${run.pull_requests_seen ?? 0} PRs`;
+  }
+  if (run.status === "running" && run.progress?.phase === "bulk") {
+    return `Bulk indexing · ${run.patch_cards_indexed ?? 0} merged PRs · ${run.pull_requests_seen ?? 0} reviewed`;
+  }
+  if (run.status === "running" && run.progress?.phase === "indexing") {
+    const total = run.progress.candidates_discovered ?? 0;
+    const current = run.progress.candidates_processed ?? 0;
+    return total ? `Indexing fixes · ${Math.min(current, total)} of ${total}` : "Indexing fixes";
+  }
+  return statusText(run.status);
+}
+
+function syncNotice(run?: SyncRun | null) {
+  if (!run?.error) return null;
+  if (run.status === "queued" && /rate.limit/i.test(run.error)) {
+    const resume = run.available_at ? ` It will resume automatically after ${formattedDate(run.available_at)}.` : " It will resume automatically.";
+    return `GitHub temporarily paused this scan to protect your account's API allowance.${resume}`;
+  }
+  return run.error;
 }
 
 function formattedDate(value?: string | null) {
@@ -309,21 +363,23 @@ export default function App() {
     if (nextView) setView(nextView);
   }
 
-  async function connectRepository(event: FormEvent) {
+  async function connectRepository(event: FormEvent<HTMLFormElement>) {
     event.preventDefault();
     if (!repositoryUrl.trim()) return;
     setError(null);
     setNotice(null);
     setIsConnecting(true);
+    const form = new FormData(event.currentTarget);
+    const ingestionMode = String(form.get("ingestion_mode") ?? "detailed") as IngestionMode;
     try {
       const response = await request<{ repository: Repository }>("/patchwork/repositories", {
         method: "POST",
         headers: { "Content-Type": "application/json" },
-        body: JSON.stringify({ github_url: repositoryUrl.trim() }),
+        body: JSON.stringify({ github_url: repositoryUrl.trim(), pull_limit: Number(form.get("pull_limit") ?? 15), ingestion_mode: ingestionMode }),
       });
       setSelectedRepositoryId(response.repository.id);
       setView("investigate");
-      setNotice(`Connected ${response.repository.full_name}. Indexing its historical fixes now.`);
+      setNotice(`Connected ${response.repository.full_name}. Indexing ${ingestionMode === "bulk" ? "merged PR summaries" : "historical fixes"} now.`);
       await refreshRepositories();
     } catch (reason) {
       setError(reason instanceof Error ? reason.message : "Could not connect this repository.");
@@ -332,7 +388,7 @@ export default function App() {
     }
   }
 
-  async function syncRepository(repository = selectedRepository) {
+  async function syncRepository(repository = selectedRepository, pullLimit?: number, ingestionMode?: IngestionMode) {
     if (!repository) return;
     setError(null);
     setNotice(null);
@@ -340,9 +396,9 @@ export default function App() {
       await request(`/patchwork/repositories/${repository.id}/sync`, {
         method: "POST",
         headers: { "Content-Type": "application/json" },
-        body: JSON.stringify({}),
+        body: JSON.stringify({ pull_limit: pullLimit, ingestion_mode: ingestionMode ?? repository.latest_sync?.progress?.ingestion_mode ?? "detailed" }),
       });
-      setNotice(`Refreshing historical fixes for ${repository.full_name}.`);
+      setNotice(`Refreshing PR history for ${repository.full_name}.`);
       await refreshRepositories();
     } catch (reason) {
       setError(reason instanceof Error ? reason.message : "Could not start a repository sync.");
@@ -383,10 +439,13 @@ export default function App() {
         `/patchwork/repositories/${selectedRepository.id}/evaluate`,
         { method: "POST" },
       );
+      if (evaluation.status === "failed") {
+        throw new Error(evaluation.error ?? "Evaluation failed. Retry after checking the repository.");
+      }
       setNotice(
         evaluation.benchmark_cases
-          ? evaluation.metrics.quality === "verified_issue_to_fix"
-            ? `Evaluation finished across ${evaluation.benchmark_cases} verified issue-to-fix examples.`
+          ? evaluation.metrics.quality !== "smoke_test"
+            ? `Evaluation finished across ${evaluation.benchmark_cases} issue-to-fix examples.`
             : `Indexing smoke test finished across ${evaluation.benchmark_cases} historical fixes.`
           : "No historical fix examples are available yet. Finish a repository sync and try again.",
       );
@@ -551,7 +610,7 @@ export default function App() {
               investigation={investigation}
               investigations={investigations}
               onReopen={(saved) => { setIssue(saved.issue); setInvestigation(saved.result); }}
-              onSync={() => void syncRepository()}
+              onSync={(limit, mode) => void syncRepository(selectedRepository, limit, mode)}
               onOpenEvaluation={() => setView("evaluation")}
               isLoading={isLoading}
             />
@@ -608,7 +667,7 @@ function InvestigateView({
   repository: Repository | null;
   repositoryUrl: string;
   onRepositoryUrlChange: (value: string) => void;
-  onConnect: (event: FormEvent) => void;
+  onConnect: (event: FormEvent<HTMLFormElement>) => void;
   isConnecting: boolean;
   issue: string;
   onIssueChange: (value: string) => void;
@@ -617,7 +676,7 @@ function InvestigateView({
   investigation: Investigation | null;
   investigations: SavedInvestigation[];
   onReopen: (saved: SavedInvestigation) => void;
-  onSync: () => void;
+  onSync: (limit: number, mode?: IngestionMode) => void;
   onOpenEvaluation: () => void;
   isLoading: boolean;
 }) {
@@ -633,7 +692,7 @@ function InvestigateView({
       {!repository && <ConnectCard repositoryUrl={repositoryUrl} onRepositoryUrlChange={onRepositoryUrlChange} onConnect={onConnect} isConnecting={isConnecting} />}
 
       {repository ? <>
-        <RepositoryOverview repository={repository} onSync={onSync} />
+        <RepositoryOverview key={repository.id} repository={repository} onSync={onSync} />
         <section className="soft-shadow mt-7 rounded-2xl border border-[#dfe7dd] bg-white p-5 sm:p-6">
           <div className="flex items-start gap-3">
             <span className="grid size-9 shrink-0 place-items-center rounded-xl bg-[#eff5ed] text-moss"><MessageSquareCode size={18} /></span>
@@ -643,7 +702,7 @@ function InvestigateView({
             <textarea value={issue} onChange={(event) => onIssueChange(event.target.value)} className="min-h-32 w-full resize-y rounded-xl border border-[#d9e3d8] bg-[#fbfcfa] p-4 text-sm leading-6 outline-none placeholder:text-[#9daf9f] focus:border-moss focus:ring-4 focus:ring-[#dfeee0]" placeholder="Example: Streaming requests hang after a client disconnects. Find a similar historical fix and the regression test it added." />
             <div className="mt-3 flex flex-col gap-3 sm:flex-row sm:items-center sm:justify-between">
               <p className="text-xs text-[#84968c]">Results are evidence to review—not an automatic code change.</p>
-              <button className="inline-flex items-center justify-center gap-2 rounded-xl bg-moss px-4 py-3 text-sm font-bold text-white transition hover:-translate-y-0.5 hover:bg-[#17483b] disabled:cursor-not-allowed disabled:opacity-50" type="submit" disabled={isInvestigating || syncing || !issue.trim()}>{isInvestigating ? <LoaderCircle size={17} className="animate-spin" /> : <Search size={17} />}{isInvestigating ? "Searching history…" : "Find similar fixes"}</button>
+              <button className="inline-flex items-center justify-center gap-2 rounded-xl bg-moss px-4 py-3 text-sm font-bold text-white transition hover:-translate-y-0.5 hover:bg-[#17483b] disabled:cursor-not-allowed disabled:opacity-50" type="submit" disabled={isInvestigating || (syncing && !repository?.latest_sync?.patch_cards_indexed) || !issue.trim()}>{isInvestigating ? <LoaderCircle size={17} className="animate-spin" /> : <Search size={17} />}{isInvestigating ? "Searching history…" : "Find similar fixes"}</button>
             </div>
           </form>
         </section>
@@ -665,7 +724,7 @@ function SavedInvestigations({ investigations, onReopen }: { investigations: Sav
 }
 
 function RepositoryLibrary({ repositories, selectedRepositoryId, repositoryUrl, onRepositoryUrlChange, onConnect, isConnecting, onSelect, onEvaluate, onSync, onDelete }: {
-  repositories: Repository[]; selectedRepositoryId: string; repositoryUrl: string; onRepositoryUrlChange: (value: string) => void; onConnect: (event: FormEvent) => void; isConnecting: boolean; onSelect: (id: string) => void; onEvaluate: (id: string) => void; onSync: (repository: Repository) => void; onDelete: (repository: Repository) => void;
+  repositories: Repository[]; selectedRepositoryId: string; repositoryUrl: string; onRepositoryUrlChange: (value: string) => void; onConnect: (event: FormEvent<HTMLFormElement>) => void; isConnecting: boolean; onSelect: (id: string) => void; onEvaluate: (id: string) => void; onSync: (repository: Repository) => void; onDelete: (repository: Repository) => void;
 }) {
   return <div className="mt-10 max-w-5xl"><section><p className="text-sm font-semibold uppercase tracking-[0.18em] text-moss">Repository library</p><h1 className="mt-2 text-4xl font-semibold tracking-[-0.045em] sm:text-5xl">Your connected codebases.</h1><p className="mt-4 max-w-2xl text-base leading-7 text-[#6d8579]">Each repository keeps an isolated history of patches, so investigations stay relevant and private to that codebase.</p></section><ConnectCard repositoryUrl={repositoryUrl} onRepositoryUrlChange={onRepositoryUrlChange} onConnect={onConnect} isConnecting={isConnecting} /><section className="mt-8"><div className="mb-4 flex items-center justify-between"><h2 className="font-semibold">Connected repositories</h2><span className="text-xs font-semibold text-[#71877c]">{repositories.length} total</span></div><div className="grid gap-4">{repositories.map((repository) => <RepositoryCard key={repository.id} repository={repository} selected={repository.id === selectedRepositoryId} onSelect={() => onSelect(repository.id)} onEvaluate={() => onEvaluate(repository.id)} onSync={() => onSync(repository)} onDelete={() => onDelete(repository)} />)}{repositories.length === 0 && <EmptyState loading={false} />}</div></section></div>;
 }
@@ -673,16 +732,49 @@ function RepositoryLibrary({ repositories, selectedRepositoryId, repositoryUrl, 
 function EvaluationLab({ repositories, repository, onSelect, onEvaluate, isEvaluating, onOpenRepositories }: { repositories: Repository[]; repository: Repository | null; onSelect: (id: string) => void; onEvaluate: () => void; isEvaluating: boolean; onOpenRepositories: () => void; }) {
   const evaluation = repository?.latest_evaluation ?? null;
   const syncing = isWorking(repository?.latest_sync?.status);
-  return <div className="mt-10 max-w-5xl"><section className="flex flex-col gap-5 sm:flex-row sm:items-end sm:justify-between"><div><p className="text-sm font-semibold uppercase tracking-[0.18em] text-moss">Evaluation lab</p><h1 className="mt-2 text-4xl font-semibold tracking-[-0.045em] sm:text-5xl">Measure retrieval, not vibes.</h1><p className="mt-4 max-w-2xl text-base leading-7 text-[#6d8579]">Patchwork measures whether a real issue report retrieves the pull request that fixed it. When a repository exposes no links, it runs a clearly labeled indexing smoke test instead.</p></div>{repositories.length > 0 && <label className="text-xs font-bold uppercase tracking-[0.12em] text-[#789084]">Repository<select value={repository?.id ?? ""} onChange={(event) => onSelect(event.target.value)} className="mt-2 block w-full rounded-xl border border-[#d9e3d8] bg-white px-3 py-2.5 text-sm font-medium normal-case tracking-normal text-ink outline-none focus:border-moss"><option value="" disabled>Select a repository</option>{repositories.map((item) => <option key={item.id} value={item.id}>{item.full_name}</option>)}</select></label>}</section>{repository ? <><section className="soft-shadow mt-8 grid overflow-hidden rounded-2xl border border-[#dfe7dd] bg-white lg:grid-cols-[1.2fr_.8fr]"><div className="p-6 sm:p-7"><div className="flex items-center gap-3"><span className="grid size-10 place-items-center rounded-xl bg-[#eef4ec] text-moss"><BarChart3 size={20} /></span><div><h2 className="font-semibold tracking-tight">Evaluate {repository.full_name}</h2><p className="mt-1 text-sm text-[#71877c]">Verified issue-to-fix pairs are stored at sync time. Their issue text is excluded from target patch cards to avoid leakage.</p></div></div><div className="mt-6 grid gap-3 sm:grid-cols-3"><Metric label="Recall at 1" value={percent(evaluation?.metrics.recall_at_1)} icon={<Search size={16} />} /><Metric label="Recall at 3" value={percent(evaluation?.metrics.recall_at_3)} icon={<Library size={16} />} /><Metric label="Mean rank" value={evaluation?.metrics.mrr === null || evaluation?.metrics.mrr === undefined ? "—" : String(evaluation.metrics.mrr)} icon={<BarChart3 size={16} />} /></div></div><div className="border-t border-[#e7ece6] bg-[#f7faf6] p-6 lg:border-l lg:border-t-0"><p className="text-sm font-semibold">Run a check</p><p className="mt-2 text-sm leading-6 text-[#71877c]">The report states whether scores are verified issue-to-fix retrieval or a lower-confidence indexing smoke test.</p><button type="button" onClick={onEvaluate} disabled={isEvaluating || syncing} className="mt-5 inline-flex w-full items-center justify-center gap-2 rounded-xl bg-ink px-4 py-3 text-sm font-bold text-white transition hover:bg-[#1b4035] disabled:cursor-not-allowed disabled:opacity-50">{isEvaluating ? <LoaderCircle size={17} className="animate-spin" /> : <Play size={16} />}{isEvaluating ? "Evaluating…" : "Run evaluation"}</button></div></section><EvaluationReportCard evaluation={evaluation} /></> : <section className="soft-shadow mt-8 rounded-2xl border border-dashed border-[#ccdace] bg-white/70 px-6 py-16 text-center"><div className="mx-auto grid size-14 place-items-center rounded-2xl bg-[#eaf2e7] text-moss"><Library size={24} /></div><h2 className="mt-5 text-lg font-semibold">Connect a repository first</h2><p className="mx-auto mt-2 max-w-md text-sm leading-6 text-[#71877c]">An evaluation needs a repository with indexed historical fixes.</p><button type="button" onClick={onOpenRepositories} className="mt-5 inline-flex items-center gap-2 rounded-xl bg-ink px-4 py-3 text-sm font-bold text-white">Open repository library <ArrowUpRight size={16} /></button></section>}</div>;
+  return <div className="mt-10 max-w-5xl"><section className="flex flex-col gap-5 sm:flex-row sm:items-end sm:justify-between"><div><p className="text-sm font-semibold uppercase tracking-[0.18em] text-moss">Evaluation lab</p><h1 className="mt-2 text-4xl font-semibold tracking-[-0.045em] sm:text-5xl">Measure retrieval, not vibes.</h1><p className="mt-4 max-w-2xl text-base leading-7 text-[#6d8579]">Patchwork measures whether a real issue report retrieves the pull request that fixed it. When a repository exposes no links, it runs a clearly labeled indexing smoke test instead.</p></div>{repositories.length > 0 && <label className="text-xs font-bold uppercase tracking-[0.12em] text-[#789084]">Repository<select value={repository?.id ?? ""} onChange={(event) => onSelect(event.target.value)} className="mt-2 block w-full rounded-xl border border-[#d9e3d8] bg-white px-3 py-2.5 text-sm font-medium normal-case tracking-normal text-ink outline-none focus:border-moss"><option value="" disabled>Select a repository</option>{repositories.map((item) => <option key={item.id} value={item.id}>{item.full_name}</option>)}</select></label>}</section>{repository ? <><section className="soft-shadow mt-8 grid overflow-hidden rounded-2xl border border-[#dfe7dd] bg-white lg:grid-cols-[1.2fr_.8fr]"><div className="p-6 sm:p-7"><div className="flex items-center gap-3"><span className="grid size-10 place-items-center rounded-xl bg-[#eef4ec] text-moss"><BarChart3 size={20} /></span><div><h2 className="font-semibold tracking-tight">Evaluate {repository.full_name}</h2><p className="mt-1 text-sm text-[#71877c]">Verified issue-to-fix pairs are stored at sync time. Their issue text is excluded from target patch cards to avoid leakage.</p></div></div><div className="mt-6 grid gap-3 sm:grid-cols-3"><Metric label="Recall at 1" value={percent(evaluation?.metrics.recall_at_1)} icon={<Search size={16} />} /><Metric label="Recall at 3" value={percent(evaluation?.metrics.recall_at_3)} icon={<Library size={16} />} /><Metric label="Reciprocal rank (MRR)" value={evaluation?.metrics.mrr === null || evaluation?.metrics.mrr === undefined ? "—" : String(evaluation.metrics.mrr)} icon={<BarChart3 size={16} />} /></div></div><div className="border-t border-[#e7ece6] bg-[#f7faf6] p-6 lg:border-l lg:border-t-0"><p className="text-sm font-semibold">Run a check</p><p className="mt-2 text-sm leading-6 text-[#71877c]">The report states whether scores are verified issue-to-fix retrieval or a lower-confidence indexing smoke test.</p><button type="button" onClick={onEvaluate} disabled={isEvaluating || syncing} className="mt-5 inline-flex w-full items-center justify-center gap-2 rounded-xl bg-ink px-4 py-3 text-sm font-bold text-white transition hover:bg-[#1b4035] disabled:cursor-not-allowed disabled:opacity-50">{isEvaluating ? <LoaderCircle size={17} className="animate-spin" /> : <Play size={16} />}{isEvaluating ? "Evaluating…" : "Run evaluation"}</button></div></section><EvaluationCaseForm repositoryId={repository.id} onSaved={onEvaluate} /><EvaluationReportCard evaluation={evaluation} /></> : <section className="soft-shadow mt-8 rounded-2xl border border-dashed border-[#ccdace] bg-white/70 px-6 py-16 text-center"><div className="mx-auto grid size-14 place-items-center rounded-2xl bg-[#eaf2e7] text-moss"><Library size={24} /></div><h2 className="mt-5 text-lg font-semibold">Connect a repository first</h2><p className="mx-auto mt-2 max-w-md text-sm leading-6 text-[#71877c]">An evaluation needs a repository with indexed historical fixes.</p><button type="button" onClick={onOpenRepositories} className="mt-5 inline-flex items-center gap-2 rounded-xl bg-ink px-4 py-3 text-sm font-bold text-white">Open repository library <ArrowUpRight size={16} /></button></section>}</div>;
 }
 
-function ConnectCard({ repositoryUrl, onRepositoryUrlChange, onConnect, isConnecting }: { repositoryUrl: string; onRepositoryUrlChange: (value: string) => void; onConnect: (event: FormEvent) => void; isConnecting: boolean; }) {
-  return <section className="soft-shadow mt-8 rounded-2xl border border-[#dfe7dd] bg-white p-5 sm:p-6"><div className="flex items-start gap-3"><span className="grid size-9 shrink-0 place-items-center rounded-xl bg-[#eef4ec] text-moss"><Link2 size={18} /></span><div><h2 className="font-semibold tracking-tight">Add a GitHub repository</h2><p className="mt-1 text-sm text-[#71877c]">Public repositories work immediately. Link GitHub from the account menu to index private repositories you can read.</p></div></div><form onSubmit={onConnect} className="mt-5 flex flex-col gap-3 sm:flex-row"><div className="flex min-w-0 flex-1 items-center gap-3 rounded-xl border border-[#d9e3d8] bg-[#fbfcfa] px-3 focus-within:border-moss focus-within:ring-4 focus-within:ring-[#dfeee0]"><Github size={18} className="shrink-0 text-[#748d80]" /><input value={repositoryUrl} onChange={(event) => onRepositoryUrlChange(event.target.value)} className="min-w-0 flex-1 bg-transparent py-3 text-sm outline-none placeholder:text-[#9daf9f]" placeholder="https://github.com/owner/repository" /></div><button className="inline-flex items-center justify-center gap-2 rounded-xl bg-ink px-4 py-3 text-sm font-bold text-white transition hover:-translate-y-0.5 hover:bg-[#1b4035] disabled:cursor-not-allowed disabled:opacity-50" type="submit" disabled={isConnecting}>{isConnecting ? <LoaderCircle size={17} className="animate-spin" /> : <Plus size={17} />}{isConnecting ? "Connecting…" : "Connect & index"}</button></form></section>;
+function EvaluationCaseForm({ repositoryId, onSaved }: { repositoryId: string; onSaved: () => void }) {
+  const [issue, setIssue] = useState("");
+  const [pull, setPull] = useState("");
+  const [saving, setSaving] = useState(false);
+  const [error, setError] = useState<string | null>(null);
+  useEffect(() => { setIssue(""); setPull(""); setError(null); }, [repositoryId]);
+  async function save(event: FormEvent) {
+    event.preventDefault();
+    setSaving(true);
+    setError(null);
+    try {
+      await request(`/patchwork/repositories/${repositoryId}/evaluation/cases`, {
+        method: "POST", headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ issue: issue.trim(), expected_pull_number: Number(pull) }),
+      });
+      setIssue(""); setPull(""); onSaved();
+    } catch (reason) {
+      setError(reason instanceof Error ? reason.message : "Could not save the test case.");
+    } finally { setSaving(false); }
+  }
+  return <section className="mt-7 rounded-2xl border border-[#dfe7dd] bg-white p-6">
+    <h2 className="font-semibold">Test a real bug report</h2>
+    <p className="mt-2 text-sm leading-6 text-[#71877c]">Describe a past bug in your own words and choose the indexed PR that fixed it. This checks whether Patchwork finds the right fix. One saved report per PR; saving again replaces it.</p>
+    <form onSubmit={save} className="mt-4 space-y-4">
+      <label className="block text-sm font-semibold">Bug report<textarea required minLength={8} maxLength={5000} value={issue} onChange={(event) => setIssue(event.target.value)} className="mt-2 block w-full rounded-xl border border-[#d9e3d8] p-3 text-sm font-normal" placeholder="Describe the symptoms without copying the PR description." /></label>
+      <label className="block text-sm font-semibold">Expected PR number<input type="number" required min={1} value={pull} onChange={(event) => setPull(event.target.value)} className="ml-3 w-32 rounded-xl border border-[#d9e3d8] p-2 font-normal" placeholder="42" /></label>
+      {error && <p role="alert" className="text-sm text-red-700">{error}</p>}
+      <button type="submit" disabled={saving} className="rounded-xl bg-ink px-4 py-3 text-sm font-bold text-white disabled:opacity-50">{saving ? "Saving…" : "Save and evaluate"}</button>
+    </form>
+  </section>;
 }
 
-function RepositoryOverview({ repository, onSync }: { repository: Repository; onSync: () => void }) {
+function ConnectCard({ repositoryUrl, onRepositoryUrlChange, onConnect, isConnecting }: { repositoryUrl: string; onRepositoryUrlChange: (value: string) => void; onConnect: (event: FormEvent<HTMLFormElement>) => void; isConnecting: boolean; }) {
+  return <section className="soft-shadow mt-8 rounded-2xl border border-[#dfe7dd] bg-white p-5 sm:p-6"><div className="flex items-start gap-3"><span className="grid size-9 shrink-0 place-items-center rounded-xl bg-[#eef4ec] text-moss"><Link2 size={18} /></span><div><h2 className="font-semibold tracking-tight">Add a GitHub repository</h2><p className="mt-1 text-sm text-[#71877c]">Public repositories work immediately. Link GitHub from the account menu to index private repositories you can read.</p></div></div><form onSubmit={onConnect} className="mt-5 flex flex-col gap-3 sm:flex-row"><label className="text-xs font-semibold text-[#71877c]">Recent fixes<select name="pull_limit" defaultValue="15" className="mt-1 block rounded-xl border border-[#d9e3d8] p-3 text-sm text-ink"><option value="15">15 (quick)</option><option value="100">100</option><option value="500">500</option><option value="10000">Up to 10,000</option></select></label><div className="flex min-w-0 flex-1 items-center gap-3 rounded-xl border border-[#d9e3d8] bg-[#fbfcfa] px-3 focus-within:border-moss focus-within:ring-4 focus-within:ring-[#dfeee0]"><Github size={18} className="shrink-0 text-[#748d80]" /><input value={repositoryUrl} onChange={(event) => onRepositoryUrlChange(event.target.value)} className="min-w-0 flex-1 bg-transparent py-3 text-sm outline-none placeholder:text-[#9daf9f]" placeholder="https://github.com/owner/repository" /></div><button className="inline-flex items-center justify-center gap-2 rounded-xl bg-ink px-4 py-3 text-sm font-bold text-white transition hover:-translate-y-0.5 hover:bg-[#1b4035] disabled:cursor-not-allowed disabled:opacity-50" type="submit" disabled={isConnecting}>{isConnecting ? <LoaderCircle size={17} className="animate-spin" /> : <Plus size={17} />}{isConnecting ? "Connecting…" : "Connect & index"}</button></form></section>;
+}
+
+function RepositoryOverview({ repository, onSync }: { repository: Repository; onSync: (limit: number) => void }) {
+  const [pullLimit, setPullLimit] = useState(15);
   const syncing = isWorking(repository.latest_sync?.status);
-  return <section className="soft-shadow mt-7 overflow-hidden rounded-2xl border border-[#dfe7dd] bg-white"><div className="flex flex-col gap-5 border-b border-[#e7ece6] px-5 py-5 sm:flex-row sm:items-center sm:justify-between"><div className="flex min-w-0 items-center gap-3"><span className="grid size-10 shrink-0 place-items-center rounded-xl bg-ink text-sage"><Github size={19} /></span><div className="min-w-0"><div className="flex items-center gap-2"><h2 className="truncate font-semibold tracking-tight">{repository.full_name}</h2><a href={repository.github_url} target="_blank" rel="noreferrer" className="text-[#779084] hover:text-moss" aria-label={`Open ${repository.full_name} on GitHub`}><ExternalLink size={15} /></a></div><p className="mt-1 truncate text-xs text-[#809489]">{repository.description || `Default branch: ${repository.default_branch}`}</p></div></div><div className="flex items-center gap-2"><StatusPill status={repository.latest_sync?.status} /><button onClick={onSync} disabled={syncing} type="button" className="inline-flex items-center gap-2 rounded-lg bg-[#eef4ec] px-3 py-2 text-xs font-bold text-moss transition hover:bg-[#dcebd7] disabled:opacity-50">{syncing ? <LoaderCircle size={14} className="animate-spin" /> : <RefreshCw size={14} />}{syncing ? "Indexing" : "Sync history"}</button></div></div><div className="grid divide-y divide-[#edf0ec] sm:grid-cols-3 sm:divide-x sm:divide-y-0"><Metric label="PRs reviewed" value={String(repository.latest_sync?.pull_requests_seen ?? 0)} icon={<Github size={16} />} /><Metric label="Fixes indexed" value={String(repository.latest_sync?.patch_cards_indexed ?? 0)} icon={<FileCode2 size={16} />} /><Metric label="Search chunks" value={String(repository.latest_sync?.chunks_indexed ?? 0)} icon={<Database size={16} />} /></div>{repository.latest_sync?.error && <div className="border-t border-amber-100 bg-amber-50 px-5 py-3 text-xs leading-5 text-amber-800">{repository.latest_sync.error}</div>}</section>;
+  return <section className="soft-shadow mt-7 overflow-hidden rounded-2xl border border-[#dfe7dd] bg-white"><div className="flex flex-col gap-5 border-b border-[#e7ece6] px-5 py-5 sm:flex-row sm:items-center sm:justify-between"><div className="flex min-w-0 items-center gap-3"><span className="grid size-10 shrink-0 place-items-center rounded-xl bg-ink text-sage"><Github size={19} /></span><div className="min-w-0"><div className="flex items-center gap-2"><h2 className="truncate font-semibold tracking-tight">{repository.full_name}</h2><a href={repository.github_url} target="_blank" rel="noreferrer" className="text-[#779084] hover:text-moss" aria-label={`Open ${repository.full_name} on GitHub`}><ExternalLink size={15} /></a></div><p className="mt-1 truncate text-xs text-[#809489]">{repository.description || `Default branch: ${repository.default_branch}`}</p></div></div><div className="flex items-center gap-2"><StatusPill status={repository.latest_sync?.status} /><select aria-label="Number of fixes to sync" value={pullLimit} onChange={(event) => setPullLimit(Number(event.target.value))} className="rounded-lg border border-[#d9e3d8] bg-white px-2 py-2 text-xs"><option value={15}>15 fixes</option><option value={100}>100 fixes</option><option value={500}>500 fixes</option><option value={10000}>Up to 10,000 fixes</option></select><button onClick={() => onSync(pullLimit)} disabled={syncing} type="button" className="inline-flex items-center gap-2 rounded-lg bg-[#eef4ec] px-3 py-2 text-xs font-bold text-moss transition hover:bg-[#dcebd7] disabled:opacity-50">{syncing ? <LoaderCircle size={14} className="animate-spin" /> : <RefreshCw size={14} />}{syncing ? "Indexing" : "Sync history"}</button></div></div><div className="grid divide-y divide-[#edf0ec] sm:grid-cols-3 sm:divide-x sm:divide-y-0"><Metric label="PRs reviewed" value={String(repository.latest_sync?.pull_requests_seen ?? 0)} icon={<Github size={16} />} /><Metric label="Fixes indexed" value={String(repository.latest_sync?.patch_cards_indexed ?? 0)} icon={<FileCode2 size={16} />} /><Metric label="Search chunks" value={String(repository.latest_sync?.chunks_indexed ?? 0)} icon={<Database size={16} />} /></div>{repository.latest_sync?.error && <div className="border-t border-amber-100 bg-amber-50 px-5 py-3 text-xs leading-5 text-amber-800">{repository.latest_sync.error}</div>}</section>;
 }
 
 function RepositoryCard({ repository, selected, onSelect, onEvaluate, onSync, onDelete }: { repository: Repository; selected: boolean; onSelect: () => void; onEvaluate: () => void; onSync: () => void; onDelete: () => void; }) {
@@ -700,19 +792,21 @@ function InvestigationPanel({ investigation }: { investigation: Investigation })
 function MatchEvidence({ match }: { match: PatchMatch }) {
   const files = match.changed_files.slice(0, 4);
   const tests = match.test_files.slice(0, 3);
-  if (!files.length && !tests.length) return null;
-  return <><div className="mt-5 grid gap-4 rounded-xl border border-[#e7ece6] bg-[#f8faf7] p-4 sm:grid-cols-2"><EvidenceFiles label="Files to inspect" files={files} icon={<Code2 size={13} />} /><EvidenceFiles label="Regression coverage" files={tests} icon={<Check size={13} />} emptyText="No test file was detected." /><div className="sm:col-span-2"><RelevanceBadge score={match.score} /></div></div><SolutionPlan solution={match.recommended_solution} /></>;
+  const reasons = match.recommended_solution?.why_this_matches?.length
+    ? match.recommended_solution.why_this_matches
+    : (match.match_reasons ?? []);
+  return <><div className="mt-5 grid gap-4 rounded-xl border border-[#e7ece6] bg-[#f8faf7] p-4 sm:grid-cols-2"><EvidenceFiles label="Files to inspect" files={files} icon={<Code2 size={13} />} /><EvidenceFiles label="Regression coverage" files={tests} icon={<Check size={13} />} emptyText="No test file was detected." /><div className="sm:col-span-2"><RelevanceBadge score={match.score} /></div>{reasons.length > 0 && <div className="sm:col-span-2"><p className="text-[10px] font-bold uppercase tracking-[0.12em] text-[#71877c]">Why this reference surfaced</p><ul className="mt-2 flex flex-wrap gap-1.5">{reasons.map((reason) => <li key={reason} className="rounded-md bg-white px-2 py-1 text-xs text-[#527064] shadow-sm ring-1 ring-[#e1e9df]">{reason}</li>)}</ul></div>}</div><SolutionPlan solution={match.recommended_solution} /></>;
 }
 
 function RelevanceBadge({ score }: { score: number }) {
   const percent = Math.round(Math.min(1, Math.max(0, score)) * 100);
-  return <p className="text-xs text-[#71877c]"><span className="font-semibold text-[#527064]">Relevance: {percent}%</span><span className="ml-2">Similarity to your report, not a probability of a correct fix.</span></p>;
+  return <p className="text-xs text-[#71877c]"><span className="font-semibold text-[#527064]">Evidence score: {percent}/100</span><span className="ml-2">Ranks semantic similarity and concrete repository signals; it is not a probability of a correct fix.</span></p>;
 }
 
 function SolutionPlan({ solution }: { solution?: RecommendedSolution }) {
   if (!solution) return null;
   const modelAssisted = solution.mode === "model_assisted";
-  return <section className="mt-5 rounded-xl border border-[#dce9d8] bg-[#f5faf2] p-4"><div className="flex flex-wrap items-center justify-between gap-2"><h3 className="text-sm font-semibold text-ink">Suggested implementation approach</h3><span className={`rounded-full px-2 py-1 text-[10px] font-bold ${modelAssisted ? "bg-[#dbeee0] text-moss" : "bg-[#edf1eb] text-[#627a6d]"}`}>{modelAssisted ? "Model-assisted" : "Evidence-guided"}</span></div><p className="mt-2 text-sm leading-6 text-[#527064]">{solution.assessment}</p><PlanList label="Suggested steps" items={solution.implementation_steps} /><PlanList label="Verify" items={solution.verification} /><PlanList label="Keep in mind" items={solution.cautions} muted />{solution.code_guidance && <div className="mt-4"><p className="text-[10px] font-bold uppercase tracking-[0.12em] text-[#71877c]">Illustrative code guidance</p><pre className="mt-2 overflow-x-auto rounded-lg bg-[#17372f] p-3 text-xs leading-5 text-[#e9f4e5]"><code>{solution.code_guidance}</code></pre></div>}</section>;
+  return <section className="mt-5 rounded-xl border border-[#dce9d8] bg-[#f5faf2] p-4"><div className="flex flex-wrap items-center justify-between gap-2"><h3 className="text-sm font-semibold text-ink">Recommended next steps</h3><span className={`rounded-full px-2 py-1 text-[10px] font-bold ${modelAssisted ? "bg-[#dbeee0] text-moss" : "bg-[#edf1eb] text-[#627a6d]"}`}>{modelAssisted ? "Model-assisted" : "Evidence-guided"}</span></div><p className="mt-2 text-sm leading-6 text-[#527064]">{solution.assessment}</p><PlanList label="Suggested steps" items={solution.implementation_steps} /><PlanList label="Verification" items={solution.verification} /><PlanList label="Before you change code" items={solution.cautions} muted />{solution.code_guidance && <div className="mt-4"><p className="text-[10px] font-bold uppercase tracking-[0.12em] text-[#71877c]">Source diff / code guidance</p><pre className="mt-2 overflow-x-auto rounded-lg bg-[#17372f] p-3 text-xs leading-5 text-[#e9f4e5]"><code>{solution.code_guidance}</code></pre></div>}</section>;
 }
 
 function PlanList({ label, items, muted = false }: { label: string; items: string[]; muted?: boolean }) {
@@ -739,13 +833,32 @@ function EvaluationReportCard({ evaluation }: { evaluation: EvaluationRun | null
     return <section className="mt-7 rounded-2xl border border-[#dfe7dd] bg-white p-6"><div className="flex items-center gap-2 text-xs font-bold uppercase tracking-[0.14em] text-moss"><BarChart3 size={15} /> No evaluation yet</div><p className="mt-3 max-w-2xl text-sm leading-6 text-[#71877c]">Run an evaluation after syncing. Patchwork prioritizes GitHub-confirmed issue-to-fix pairs and falls back to an explicitly non-reportable smoke test only when the repository has no linked issues.</p></section>;
   }
   const failures = evaluation.metrics.failure_samples ?? [];
-  const verified = evaluation.metrics.quality === "verified_issue_to_fix";
+  const verified = evaluation.metrics.quality !== "smoke_test";
   const breakdown = evaluation.metrics.case_breakdown;
-  return <section className="mt-7 rounded-2xl border border-[#dfe7dd] bg-white p-6"><div className="flex flex-wrap items-center justify-between gap-3"><div><div className="flex items-center gap-2 text-xs font-bold uppercase tracking-[0.14em] text-moss"><BarChart3 size={15} /> Latest evaluation</div><p className="mt-2 text-sm text-[#71877c]">Run {formattedDate(evaluation.created_at)} · {evaluation.benchmark_cases} {verified ? "verified issue-to-fix" : "indexing smoke-test"} {evaluation.benchmark_cases === 1 ? "example" : "examples"}</p></div><span className={`rounded-full px-2.5 py-1 text-[10px] font-bold uppercase tracking-[0.1em] ${verified ? "bg-[#eaf4e5] text-moss" : "bg-amber-50 text-amber-700"}`}>{verified ? "Verified data" : "Smoke test"}</span></div><p className="mt-5 max-w-3xl rounded-xl bg-[#f5f8f4] p-4 text-sm leading-6 text-[#587164]">{evaluation.metrics.note ?? "Metrics are available after the evaluation completes."}</p>{breakdown && <div className="mt-4 flex flex-wrap gap-2 text-xs"><span className="rounded-lg bg-[#eef4ec] px-2.5 py-1.5 font-semibold text-moss">{breakdown.verified_issue_to_fix} verified pairs</span><span className="rounded-lg bg-amber-50 px-2.5 py-1.5 font-semibold text-amber-700">{breakdown.pr_description_smoke_test} smoke checks</span></div>}{evaluation.error && <p className="mt-4 text-sm text-red-700">{evaluation.error}</p>}{failures.length > 0 && <div className="mt-5"><h3 className="text-sm font-semibold">Examples that need review</h3><div className="mt-3 space-y-2">{failures.map((failure, index) => <div key={`${failure.expected_pull_number}-${index}`} className="rounded-xl border border-amber-100 bg-amber-50 px-4 py-3 text-sm text-amber-900"><span className="font-semibold">Expected PR #{failure.expected_pull_number ?? "?"}</span><span className="mx-2 text-amber-400">·</span>{failure.query}</div>)}</div></div>}</section>;
+  return <section className="mt-7 rounded-2xl border border-[#dfe7dd] bg-white p-6"><div className="flex flex-wrap items-center justify-between gap-3"><div><div className="flex items-center gap-2 text-xs font-bold uppercase tracking-[0.14em] text-moss"><BarChart3 size={15} /> Latest evaluation</div><p className="mt-2 text-sm text-[#71877c]">Run {formattedDate(evaluation.created_at)} · {evaluation.benchmark_cases} {verified ? "issue-to-fix" : "indexing smoke-test"} {evaluation.benchmark_cases === 1 ? "example" : "examples"}</p></div><span className={`rounded-full px-2.5 py-1 text-[10px] font-bold uppercase tracking-[0.1em] ${verified ? "bg-[#eaf4e5] text-moss" : "bg-amber-50 text-amber-700"}`}>{verified ? "Issue-to-fix checks" : "Smoke test"}</span></div><p className="mt-5 max-w-3xl rounded-xl bg-[#f5f8f4] p-4 text-sm leading-6 text-[#587164]">{evaluation.metrics.note ?? "Metrics are available after the evaluation completes."}</p>{breakdown && <div className="mt-4 flex flex-wrap gap-2 text-xs"><span className="rounded-lg bg-[#eef4ec] px-2.5 py-1.5 font-semibold text-moss">{breakdown.verified_issue_to_fix} GitHub-linked pairs · {breakdown.user_labeled_issue ?? 0} your test cases</span><span className="rounded-lg bg-amber-50 px-2.5 py-1.5 font-semibold text-amber-700">{breakdown.pr_description_smoke_test} smoke checks</span></div>}{evaluation.error && <p className="mt-4 text-sm text-red-700">{evaluation.error}</p>}{failures.length > 0 && <div className="mt-5"><h3 className="text-sm font-semibold">Examples that need review</h3><div className="mt-3 space-y-2">{failures.map((failure, index) => <div key={`${failure.expected_pull_number}-${index}`} className="rounded-xl border border-amber-100 bg-amber-50 px-4 py-3 text-sm text-amber-900"><span className="font-semibold">Expected PR #{failure.expected_pull_number ?? "?"}</span><span className="mx-2 text-amber-400">·</span>{failure.query}</div>)}</div></div>}<EvaluationCaseResults evaluation={evaluation} /></section>;
 }
 
 function AuthLoading() {
   return <main className="grid min-h-screen place-items-center bg-paper text-ink"><div className="flex items-center gap-3 text-sm font-semibold text-[#648276]"><LoaderCircle size={18} className="animate-spin" /> Loading your workspace…</div></main>;
+}
+
+function EvaluationCaseResults({ evaluation }: { evaluation: EvaluationRun }) {
+  const cases = evaluation.metrics.case_results ?? [];
+  const advice = evaluation.metrics.recommendations ?? [];
+  return <section className="mt-6 space-y-4">
+    <p className="text-sm text-[#71877c]">Checked {evaluation.benchmark_cases} of {evaluation.metrics.available_cases ?? evaluation.benchmark_cases} available reports against {evaluation.metrics.indexed_fixes ?? "—"} indexed fixes in {evaluation.metrics.duration_seconds ?? "—"} seconds. Up to 50 reports are sampled per run.</p>
+    {advice.length > 0 && <div className="rounded-xl bg-[#eef4ec] p-4"><h3 className="text-sm font-semibold">What to do next</h3><ul className="mt-2 list-disc space-y-2 pl-5 text-sm leading-6 text-[#527064]">{advice.map((item) => <li key={item}>{item}</li>)}</ul></div>}
+    {cases.length > 0 && <h3 className="font-semibold">Report-by-report results</h3>}
+    {cases.map((item, index) => <details key={`${item.expected_pull_number}-${index}`} className="rounded-xl border border-[#dfe7dd] bg-white p-4" open={item.rank !== 1}>
+      <summary className="cursor-pointer text-sm font-semibold">Expected PR #{item.expected_pull_number} · {item.rank === 1 ? "Correct first result" : item.rank ? `Found at position ${item.rank}` : "Missing from results"}</summary>
+      <p className="mt-3 whitespace-pre-wrap text-sm leading-6 text-[#527064]">{item.query}</p>
+      <p className="mt-2 text-xs text-[#71877c]">{item.source_kind === "pr_description_smoke_test" ? "PR-description smoke check" : item.source_kind === "user_labeled_issue" ? "Your labeled test case" : "GitHub-linked issue"}</p>
+      {item.expected_pull_url && <a href={item.expected_pull_url} target="_blank" rel="noreferrer" className="mt-3 inline-block text-sm font-bold text-moss underline">Review expected PR #{item.expected_pull_number}</a>}
+      {item.issue_url && <a href={item.issue_url} target="_blank" rel="noreferrer" className="ml-4 text-sm text-moss underline">Original issue</a>}
+      <p className="mt-3 text-xs font-bold uppercase text-[#71877c]">Actual suggestions</p>
+      {item.retrieved.length ? <ol className="mt-2 list-decimal space-y-2 pl-5 text-sm">{item.retrieved.map((hit) => <li key={hit.pull_url}><a href={hit.pull_url} target="_blank" rel="noreferrer" className="text-moss underline">PR #{hit.pull_number} · {hit.title || "Historical fix"}</a></li>)}</ol> : <p className="mt-2 text-sm text-[#71877c]">No sufficiently relevant PR was returned.</p>}
+    </details>)}
+  </section>;
 }
 
 function AuthScreen({ onAuthenticated }: { onAuthenticated: (session: Session) => void }) {

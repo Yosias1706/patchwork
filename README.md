@@ -96,19 +96,26 @@ The React dashboard has three working views:
 
 - **Investigate**: choose a repository, describe a regression, then review a concise finding and linked historical PR cards. Each card lists affected files and regression tests without exposing raw diff fragments or retrieval internals.
 - **Repositories**: add GitHub URLs, view every connected repository, select one for investigation, refresh its patch history, open its evaluation, or remove its local indexed data.
-- **Evaluation lab**: select a repository and measure Recall@1, Recall@3, and MRR against a durable manifest of GitHub issue-to-fix pairs captured during sync. It identifies verified data versus a non-reportable PR-description smoke test.
+- **Evaluation lab**: check whether a past bug report retrieves its expected PR. Add your own test reports or use issue-to-fix pairs captured during sync. Each result shows the expected PR, returned PRs and their ranks.
 
-When a repository does not expose linked GitHub issues, the evaluation lab runs clearly labeled PR-description retrieval checks instead of returning an empty evaluation. These confirm indexing and repository scoping but are not presented as a real incident-retrieval benchmark.
+When a repository has no linked issues or user-provided tests, the lab runs clearly labeled PR-description smoke checks. These mainly confirm indexing: they reuse indexed text and cannot measure real incident-retrieval quality. Add a bug report written in your own words and the number of an indexed PR to run a more meaningful check. Each evaluation samples at most 50 cases.
 
 ## Using Patchwork
 
 1. Connect a GitHub.com repository in the dashboard. Patchwork verifies the repository and queues a sync.
-2. The sync scans recent closed PRs carrying the `bug` label, retains merged fixes, and indexes their descriptions, metadata, changed-file list, test-file list, and patch text.
+2. The sync scans recent closed PRs for merged fixes with bug labels or repair language, and indexes their descriptions, metadata, changed-file list, test-file list, and patch text. It stops at the requested fix limit or after 10,000 closed PRs; it does not index every PR.
 3. Paste a bug report, stack trace, or incident description into **Investigate a new issue**.
 4. Review the generated summary together with the historical PR cards. Follow the PR URL, inspect the diff, and reuse the test pattern as appropriate.
 5. Run **Evaluation lab** to measure retrieval over issue/PR pairs. GitHub-linked pairs are persisted with their source and provenance at sync time. Patchwork keeps issue text out of the indexed target patch card, which prevents the target document from winning merely because it contains the test question.
 
 For GitHub's unauthenticated rate limit, the dashboard defaults to 15 candidate PRs per sync. Use a fine-grained GitHub token for larger public syncs or private repositories.
+
+PR details are fetched with four bounded concurrent workers by default, with a shared
+minimum interval between requests. The worker checkpoints each PR in order and pauses
+when GitHub reports a rate limit; parallel requests do not increase GitHub's hourly
+allowance. Choose a larger sync in the dashboard or set `PATCHWORK_DEFAULT_PULL_LIMIT`.
+The scan covers at most 10,000 closed PRs and indexes merged repair candidates, so it
+is not a complete archive of every pull request in a larger repository.
 
 ## CLI
 
@@ -141,6 +148,7 @@ rag-search ask "How long are documents retained?"
 | `POST` | `/patchwork/repositories/{id}/sync` | Start a fresh sync. |
 | `POST` | `/patchwork/repositories/{id}/investigate` | Retrieve analogous historical fixes for an incident. |
 | `POST` | `/patchwork/repositories/{id}/evaluate` | Measure repository retrieval with linked issue/PR pairs. |
+| `POST` | `/patchwork/repositories/{id}/evaluation/cases` | Save a bug report and the indexed PR expected to fix it. |
 | `DELETE` | `/patchwork/repositories/{id}` | Remove the repository and its indexed patch cards. |
 
 ## Deployment
@@ -203,8 +211,10 @@ Copy `.env.example` to `.env`. Environment variables take precedence.
 | `PATCHWORK_GITHUB_OAUTH_REDIRECT_URL` | unset | Exact GitHub OAuth callback URL: `/auth/github/callback`. |
 | `PATCHWORK_TOKEN_ENCRYPTION_KEY` | unset | Stable Fernet key for encrypting stored GitHub access/refresh tokens. |
 | `PATCHWORK_WEB_URL` | local Vite URL | Dashboard URL used after a GitHub OAuth callback. |
-| `PATCHWORK_DEFAULT_PULL_LIMIT` | `10000` | Maximum repair candidates to index, 1–10,000 through the API. Patchwork pages through up to 10,000 closed-PR summaries and rate-limits/checkpoints detailed repair indexing so a sync resumes safely after an interruption. |
+| `PATCHWORK_DEFAULT_PULL_LIMIT` | `15` | Maximum merged repair candidates per sync, 1–10,000 through the API. Discovery stops once this limit is reached, and scans at most 10,000 closed PRs. |
 | `PATCHWORK_SYNC_LEASE_SECONDS` | `900` | Time after which an abandoned sync can be safely reclaimed. |
+| `PATCHWORK_GITHUB_FETCH_WORKERS` | `4` | Concurrent PR-detail reads per sync batch, from 1 to 8. |
+| `PATCHWORK_GITHUB_REQUEST_INTERVAL_SECONDS` | `0.2` | Minimum spacing between request starts within a sync client, from 0.1 to 60 seconds. |
 | `RAG_CORS_ORIGINS` | local Vite origins | Browser origins allowed to call the API. |
 | `RAG_EMBEDDING_PROVIDER` | `hashing` | `hashing` or `openai_compatible`. |
 | `RAG_LLM_PROVIDER` | `extractive` | `extractive` produces evidence-guided implementation plans; `openai_compatible` additionally produces a grounded model-assisted plan from retrieved Patchwork evidence. |

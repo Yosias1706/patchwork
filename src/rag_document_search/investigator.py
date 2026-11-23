@@ -12,6 +12,7 @@ import re
 from collections import defaultdict
 from dataclasses import asdict, dataclass
 
+from .embeddings import _normalize_token
 from .models import SearchHit
 from .service import RAGService
 
@@ -38,6 +39,31 @@ _STOP_WORDS = frozenset(
         "when",
         "with",
         "would",
+        "the",
+        "and",
+        "are",
+        "does",
+        "not",
+        "this",
+        "that",
+        "then",
+        "there",
+        "using",
+        "instead",
+        "into",
+        "should",
+        "report",
+        "please",
+        "find",
+        "similar",
+        "fix",
+        "fixed",
+        "fixes",
+        "can",
+        "cannot",
+        "has",
+        "our",
+        "its",
     }
 )
 
@@ -87,6 +113,16 @@ class InvestigationOutcome:
     retrieval: RetrievalResult
 
 
+@dataclass(frozen=True, slots=True)
+class _IncidentSignals:
+    """Concrete incident details used to validate semantic retrieval results."""
+
+    errors: tuple[str, ...]
+    paths: tuple[str, ...]
+    symbols: tuple[str, ...]
+    symptoms: tuple[str, ...]
+
+
 class InvestigationAgent:
     """Plans multi-query retrieval, fuses evidence, and generates a grounded answer.
 
@@ -100,9 +136,7 @@ class InvestigationAgent:
     def __init__(self, rag: RAGService) -> None:
         self.rag = rag
 
-    def retrieve(
-        self, repository_id: str, issue: str, *, limit: int = 5
-    ) -> RetrievalResult:
+    def retrieve(self, repository_id: str, issue: str, *, limit: int = 5) -> RetrievalResult:
         if not issue.strip():
             raise ValueError("Issue description must not be empty")
         if not 1 <= limit <= 10:
@@ -125,7 +159,7 @@ class InvestigationAgent:
             for rank, hit in enumerate(candidates, start=1):
                 grouped[hit.source].append((hit, rank, directive.weight, directive.purpose))
 
-        ranked = _fuse_by_source(grouped, limit)
+        ranked = _fuse_by_source(grouped, limit, _incident_signals(issue))
         confidence, reason = _confidence(ranked, grouped)
         return RetrievalResult(
             plan=plan,
@@ -162,9 +196,24 @@ class InvestigationAgent:
 
 
 def _fuse_by_source(
-    grouped: dict[str, list[tuple[SearchHit, int, float, str]]], limit: int
+    grouped: dict[str, list[tuple[SearchHit, int, float, str]]],
+    limit: int,
+    signals: _IncidentSignals,
 ) -> list[SearchHit]:
     scored: list[tuple[float, SearchHit]] = []
+    corpora = {
+        source: _signal_tokens(_hit_corpus(*(entry[0] for entry in entries)))
+        for source, entries in grouped.items()
+    }
+    distinctive_terms = {
+        term
+        for term in signals.symptoms
+        if sum(_signal_token(term) in tokens for tokens in corpora.values())
+        <= max(1, len(corpora) // 2)
+    }
+    has_distinctive_evidence = any(
+        _signal_token(term) in tokens for term in distinctive_terms for tokens in corpora.values()
+    )
     for source, entries in grouped.items():
         fused_score = sum(weight / (60 + rank) for _, rank, weight, _ in entries)
         strongest = max(entries, key=lambda entry: entry[0].score)[0]
@@ -174,14 +223,39 @@ def _fuse_by_source(
             if hit.ordinal == 0 or "# Historical bug fix:" in hit.text
         ]
         display = max(overview_candidates or [strongest], key=lambda hit: hit.score)
+        support_count = len({purpose for _, _, _, purpose in entries})
+        direct_signal_score, reasons, matched_terms = _evidence_for_hit(
+            display, strongest, signals, support_count
+        )
+        concrete = any(
+            term in matched_terms for term in (*signals.errors, *signals.paths, *signals.symbols)
+        )
+        if not concrete and len(matched_terms) < 2:
+            continue
+        if (
+            has_distinctive_evidence
+            and not concrete
+            and not distinctive_terms.intersection(matched_terms)
+        ):
+            continue
+        semantic_score = _bounded_score(strongest.score)
+        support_score = min(support_count / 3, 1.0)
+        # Retrieval must remain semantic, but concrete repository evidence should
+        # break ties and prevent generic PR language from outranking an exact
+        # error, path, or symbol match.
+        relevance_score = 0.32 * semantic_score + 0.28 * support_score + 0.40 * direct_signal_score
         metadata = {
             **strongest.metadata,
             "agent_fusion_score": round(fused_score, 5),
-            "agent_query_support": len({purpose for _, _, _, purpose in entries}),
+            "agent_query_support": support_count,
+            "agent_direct_signal_score": round(direct_signal_score, 4),
+            "agent_relevance_score": round(relevance_score, 4),
+            "agent_match_reasons": reasons,
+            "agent_matched_terms": matched_terms,
         }
         scored.append(
             (
-                fused_score,
+                relevance_score,
                 SearchHit(
                     chunk_id=display.chunk_id,
                     document_id=display.document_id,
@@ -205,21 +279,115 @@ def _confidence(
         return "no_similar_fix_found", "No repository-scoped search produced evidence."
     leading = ranked[0]
     supporting_queries = len({purpose for _, _, _, purpose in grouped[leading.source]})
-    has_tests = bool(leading.metadata.get("test_files"))
-    if supporting_queries >= 2 and has_tests:
-        return "high", "The leading patch was supported by multiple planned searches and has tests."
-    if leading.score >= 0.18:
+    direct_evidence = float(leading.metadata.get("agent_direct_signal_score", 0))
+    if supporting_queries >= 2 and direct_evidence >= 0.25:
+        return (
+            "high",
+            "The leading patch is supported by multiple searches and concrete repository evidence.",
+        )
+    if direct_evidence >= 0.15 or leading.score >= 0.18:
         return (
             "moderate",
-            "The leading patch has meaningful lexical-semantic overlap with the incident.",
+            "The leading patch has meaningful overlap with the reported behavior.",
         )
     return "low", "Evidence was found, but it came from a weak or narrow signal."
+
+
+def _incident_signals(issue: str) -> _IncidentSignals:
+    normalized = " ".join(issue.strip().split())[:1200]
+    return _IncidentSignals(
+        errors=tuple(_unique(_ERROR_NAME.findall(normalized))[:3]),
+        paths=tuple(_unique(_PATH.findall(normalized))[:3]),
+        symbols=tuple(
+            _unique(match.rstrip("(").strip() for match in _SYMBOL.findall(normalized))[:3]
+        ),
+        symptoms=tuple(_symptom_terms(normalized)[:24]),
+    )
+
+
+def _evidence_for_hit(
+    display: SearchHit,
+    strongest: SearchHit,
+    signals: _IncidentSignals,
+    support_count: int,
+) -> tuple[float, list[str], list[str]]:
+    corpus = _hit_corpus(display, strongest)
+    matched_errors = _matching_terms(signals.errors, corpus)
+    matched_paths = _matching_terms(signals.paths, corpus)
+    matched_symbols = _matching_symbols(signals.symbols, corpus)
+    corpus_tokens = _signal_tokens(corpus)
+    matched_symptoms = [term for term in signals.symptoms if _signal_token(term) in corpus_tokens]
+    has_tests = bool(strongest.metadata.get("test_files"))
+
+    score = min(0.45, 0.25 * len(matched_errors))
+    score += min(0.30, 0.18 * len(matched_paths))
+    score += min(0.18, 0.12 * len(matched_symbols))
+    score += min(0.14, 0.025 * len(matched_symptoms))
+    if has_tests:
+        score += 0.08
+    score = min(score, 1.0)
+
+    reasons: list[str] = []
+    reasons.extend(f"Matches error: {term}" for term in matched_errors[:1])
+    reasons.extend(f"Touches {term}" for term in matched_paths[:1])
+    reasons.extend(f"References {term}()" for term in matched_symbols[:1])
+    if support_count > 1:
+        reasons.append(f"Found by {support_count} independent retrieval signals")
+    if has_tests:
+        reasons.append("Includes regression test coverage")
+    if matched_symptoms:
+        reasons.append("Shares incident terms: " + ", ".join(matched_symptoms[:4]))
+    if not reasons:
+        reasons.append("Ranks highly across repository-scoped repair history")
+    return (
+        score,
+        reasons[:4],
+        [*matched_errors, *matched_paths, *matched_symbols, *matched_symptoms],
+    )
+
+
+def _hit_corpus(*hits: SearchHit) -> str:
+    values: list[str] = []
+    for hit in hits:
+        values.append(hit.text)
+        for key in ("filename", "pull_title", "pull_body", "changed_files", "test_files"):
+            value = hit.metadata.get(key)
+            if isinstance(value, (list, tuple)):
+                values.extend(str(item) for item in value)
+            elif value:
+                values.append(str(value))
+    return "\n".join(values).casefold()
+
+
+def _matching_terms(terms: tuple[str, ...], corpus: str) -> list[str]:
+    return [term for term in terms if term.casefold() in corpus]
+
+
+def _matching_symbols(symbols: tuple[str, ...], corpus: str) -> list[str]:
+    return [
+        symbol for symbol in symbols if re.search(rf"\b{re.escape(symbol.casefold())}\s*\(", corpus)
+    ]
+
+
+def _bounded_score(score: float) -> float:
+    return min(max(score, 0.0), 1.0)
+
+
+def _signal_token(token: str) -> str:
+    normalized = _normalize_token(token)
+    if normalized.startswith(("cancel", "disconnect")):
+        return "cancel" if normalized.startswith("cancel") else "disconnect"
+    return normalized
+
+
+def _signal_tokens(text: str) -> set[str]:
+    return {_signal_token(token) for token in re.findall(r"[a-z0-9]+", text.casefold())}
 
 
 def _symptom_terms(text: str) -> list[str]:
     return [
         token.lower()
-        for token in _unique(_WORD.findall(text))
+        for token in _unique([word.lower() for word in _WORD.findall(text)])
         if token.lower() not in _STOP_WORDS and not token.isdigit()
     ]
 

@@ -9,7 +9,7 @@ from contextlib import asynccontextmanager
 from dataclasses import asdict
 from pathlib import Path
 from tempfile import NamedTemporaryFile
-from typing import Annotated
+from typing import Annotated, Literal
 
 from fastapi import Depends, FastAPI, File, HTTPException, UploadFile, status
 from fastapi.middleware.cors import CORSMiddleware
@@ -56,6 +56,8 @@ app.add_middleware(
     allow_methods=["*"],
     allow_headers=["*"],
 )
+
+
 class DirectoryIngestRequest(BaseModel):
     path: str = Field(description="Server-local directory containing supported documents")
     continue_on_error: bool = True
@@ -67,8 +69,11 @@ class SearchRequest(BaseModel):
 
 
 class RepositoryConnectRequest(BaseModel):
-    github_url: str = Field(description="GitHub repository URL, for example https://github.com/fastapi/fastapi")
+    github_url: str = Field(
+        description="GitHub repository URL, for example https://github.com/fastapi/fastapi"
+    )
     pull_limit: int | None = Field(default=None, ge=1, le=10_000)
+    ingestion_mode: Literal["detailed", "bulk"] = "detailed"
 
 
 class InvestigateRequest(BaseModel):
@@ -81,11 +86,17 @@ class InvestigateRequest(BaseModel):
 
 class RepositorySyncRequest(BaseModel):
     pull_limit: int | None = Field(default=None, ge=1, le=10_000)
+    ingestion_mode: Literal["detailed", "bulk"] = "detailed"
 
 
 class CredentialsRequest(BaseModel):
     email: str = Field(min_length=3, max_length=320)
     password: str = Field(min_length=10, max_length=256)
+
+
+class EvaluationCaseRequest(BaseModel):
+    issue: str = Field(min_length=8, max_length=5000)
+    expected_pull_number: int = Field(ge=1)
 
 
 def current_user(
@@ -194,7 +205,10 @@ def connect_patchwork_repository(
 ) -> dict[str, object]:
     try:
         repository, run = patchwork.connect_repository(
-            request.github_url, user_id=str(user["id"]), pull_limit=request.pull_limit
+            request.github_url,
+            user_id=str(user["id"]),
+            pull_limit=request.pull_limit,
+            ingestion_mode=request.ingestion_mode,
         )
         sync_worker.notify()
         return {"repository": repository, "sync_run": run}
@@ -224,7 +238,10 @@ def sync_patchwork_repository(
         raise HTTPException(status_code=404, detail="Repository not found")
     try:
         _, run = patchwork.connect_repository(
-            str(existing["github_url"]), user_id=user_id, pull_limit=request.pull_limit
+            str(existing["github_url"]),
+            user_id=user_id,
+            pull_limit=request.pull_limit,
+            ingestion_mode=request.ingestion_mode,
         )
         sync_worker.notify()
         return {"repository": existing, "sync_run": run}
@@ -267,6 +284,25 @@ def evaluate_patchwork_repository(
     except KeyError as error:
         raise HTTPException(status_code=404, detail="Repository not found") from error
     except (RuntimeError, ValueError) as error:
+        raise HTTPException(status_code=422, detail=str(error)) from error
+
+
+@app.post("/patchwork/repositories/{repository_id}/evaluation/cases", status_code=201)
+def add_patchwork_evaluation_case(
+    repository_id: str,
+    request: EvaluationCaseRequest,
+    user: dict[str, object] = Depends(current_user),
+) -> dict[str, object]:
+    try:
+        return patchwork.add_evaluation_case(
+            repository_id,
+            user_id=str(user["id"]),
+            issue=request.issue,
+            expected_pull_number=request.expected_pull_number,
+        )
+    except KeyError as error:
+        raise HTTPException(status_code=404, detail="Repository not found") from error
+    except ValueError as error:
         raise HTTPException(status_code=422, detail=str(error)) from error
 
 

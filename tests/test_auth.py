@@ -1,6 +1,7 @@
 from datetime import UTC, datetime
 
 import pytest
+
 from rag_document_search.auth import AuthenticationError, AuthenticationService
 
 

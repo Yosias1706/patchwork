@@ -1,13 +1,17 @@
+import threading
+
 import pytest
 
 from rag_document_search.github import (
     GitHubClient,
     GitHubError,
     GitHubIssueLink,
+    GitHubRateLimited,
     GitHubRepository,
     _balanced_repair_candidates,
     _closing_issue_numbers,
     _patch_card,
+    is_repair_candidate,
     parse_github_repository_url,
 )
 
@@ -17,6 +21,13 @@ def test_parse_github_repository_url() -> None:
         "fastapi",
         "fastapi",
     )
+
+
+def test_template_repair_language_does_not_make_dependency_updates_fixes() -> None:
+    assert not is_repair_candidate(
+        {"number": 1, "title": "Bump dependency group", "body": "Fixes and bug reports welcome."}
+    )
+    assert is_repair_candidate({"number": 2, "title": "Fix dependency cleanup on cancellation"})
     assert parse_github_repository_url("https://github.com/pallets/flask.git") == (
         "pallets",
         "flask",
@@ -97,8 +108,13 @@ def test_closed_pull_history_paginates_until_the_last_page(
 ) -> None:
     client = GitHubClient("https://api.github.com")
     repository = GitHubRepository(
-        github_url="https://github.com/example/api", full_name="example/api", owner="example",
-        name="api", default_branch="main", description=None, is_private=False,
+        github_url="https://github.com/example/api",
+        full_name="example/api",
+        owner="example",
+        name="api",
+        default_branch="main",
+        description=None,
+        is_private=False,
     )
     first_page = [{"number": number} for number in range(1, 101)]
     requests: list[int] = []
@@ -124,7 +140,43 @@ def test_github_timeout_becomes_a_recoverable_error(monkeypatch: pytest.MonkeyPa
     monkeypatch.setattr("rag_document_search.github.time.sleep", lambda _seconds: None)
 
     with pytest.raises(GitHubError, match="did not respond"):
-        GitHubClient("https://api.github.com", timeout=1)._get("/repos/example/api")
+        GitHubClient(
+            "https://api.github.com", timeout=1, minimum_request_interval_seconds=0
+        )._get("/repos/example/api")
+
+
+def test_rate_limit_stops_other_workers_before_they_make_requests() -> None:
+    client = GitHubClient("https://api.github.com")
+    first = client._stop_for_rate_limit({"Retry-After": "120"})
+    with pytest.raises(GitHubRateLimited) as blocked:
+        client._wait_for_request_slot()
+    assert blocked.value is first
+    assert blocked.value.retry_after_seconds == 125
+
+
+def test_rate_limit_wakes_a_worker_waiting_for_a_request_slot() -> None:
+    client = GitHubClient("https://api.github.com", minimum_request_interval_seconds=5)
+    client._wait_for_request_slot()
+    started = threading.Event()
+    finished = threading.Event()
+    blocked = []
+
+    def wait_for_slot() -> None:
+        started.set()
+        try:
+            client._wait_for_request_slot()
+        except GitHubRateLimited as error:
+            blocked.append(error)
+        finally:
+            finished.set()
+
+    worker = threading.Thread(target=wait_for_slot)
+    worker.start()
+    assert started.wait(timeout=1)
+    client._stop_for_rate_limit({"Retry-After": "60"})
+    assert finished.wait(timeout=1)
+    worker.join()
+    assert len(blocked) == 1
 
 
 def test_public_client_uses_server_side_oauth_credentials_when_no_user_token_exists() -> None:

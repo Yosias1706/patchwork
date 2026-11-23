@@ -43,6 +43,8 @@ class Settings:
     patchwork_default_pull_limit: int
     sync_worker_poll_seconds: int
     sync_lease_seconds: int
+    github_fetch_workers: int = 4
+    github_request_interval_seconds: float = 0.2
 
     @classmethod
     def from_environment(cls) -> Settings:
@@ -60,9 +62,18 @@ class Settings:
         if llm_provider not in {"extractive", "openai_compatible"}:
             raise ValueError(f"Unsupported RAG_LLM_PROVIDER: {llm_provider}")
 
-        patchwork_default_pull_limit = _positive_int("PATCHWORK_DEFAULT_PULL_LIMIT", 10_000)
+        patchwork_default_pull_limit = _positive_int("PATCHWORK_DEFAULT_PULL_LIMIT", 15)
         if patchwork_default_pull_limit > 10_000:
             raise ValueError("PATCHWORK_DEFAULT_PULL_LIMIT must be at most 10000")
+
+        github_fetch_workers = _positive_int("PATCHWORK_GITHUB_FETCH_WORKERS", 4)
+        if github_fetch_workers > 8:
+            raise ValueError("PATCHWORK_GITHUB_FETCH_WORKERS must be at most 8")
+        github_request_interval_seconds = float(
+            os.getenv("PATCHWORK_GITHUB_REQUEST_INTERVAL_SECONDS", "0.2")
+        )
+        if not 0.1 <= github_request_interval_seconds <= 60:
+            raise ValueError("PATCHWORK_GITHUB_REQUEST_INTERVAL_SECONDS must be between 0.1 and 60")
 
         # Render provides its public URL at runtime. Explicit Patchwork settings
         # still win, which keeps custom-domain and local deployments predictable.
@@ -112,4 +123,6 @@ class Settings:
             patchwork_default_pull_limit=patchwork_default_pull_limit,
             sync_worker_poll_seconds=_positive_int("PATCHWORK_SYNC_WORKER_POLL_SECONDS", 2),
             sync_lease_seconds=_positive_int("PATCHWORK_SYNC_LEASE_SECONDS", 900),
+            github_fetch_workers=github_fetch_workers,
+            github_request_interval_seconds=github_request_interval_seconds,
         )

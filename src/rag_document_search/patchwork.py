@@ -3,10 +3,13 @@
 from __future__ import annotations
 
 import re
-from dataclasses import asdict
+import time
+from concurrent.futures import Future, ThreadPoolExecutor
+from dataclasses import asdict, replace
 from typing import Any
 
 from .github import (
+    PATCH_CARD_VERSION,
     GitHubClient,
     GitHubError,
     GitHubRateLimited,
@@ -37,16 +40,25 @@ class PatchworkService:
         self.solution_agent = SolutionAgent(build_solution_generator(rag.settings))
 
     def connect_repository(
-        self, github_url: str, *, user_id: str, pull_limit: int | None = None
+        self,
+        github_url: str,
+        *,
+        user_id: str,
+        pull_limit: int | None = None,
+        ingestion_mode: str = "detailed",
     ) -> tuple[dict[str, object], dict[str, object]]:
+        if ingestion_mode != "detailed":
+            raise ValueError("Bulk ingestion is not available yet. Use detailed ingestion.")
+        if pull_limit is not None and not 1 <= pull_limit <= 10_000:
+            raise ValueError("Patchwork supports between 1 and 10000 historical fixes per sync")
         repository = self._github_client(user_id).repository(github_url)
         stored_repository = self.index.upsert_patchwork_repository(
             repository.as_storage_details(), user_id=user_id
         )
-        requested_limit = pull_limit or self.rag.settings.patchwork_default_pull_limit
-        run = self.index.create_patchwork_sync_run(
-            str(stored_repository["id"]), requested_limit
+        requested_limit = (
+            self.rag.settings.patchwork_default_pull_limit if pull_limit is None else pull_limit
         )
+        run = self.index.create_patchwork_sync_run(str(stored_repository["id"]), requested_limit)
         return stored_repository, run
 
     def sync_repository(self, repository_id: str, run_id: str) -> None:
@@ -97,8 +109,9 @@ class PatchworkService:
         state: dict[str, object],
         client: GitHubClient,
     ) -> None:
-        """Checkpoint closed-PR discovery page by page before requesting any diff."""
+        """Discover only as much history as needed and make each page usable early."""
         candidates = state["candidate_pull_numbers"]
+        summaries = state.setdefault("candidate_summaries", {})
         known = set(candidates)
         seen = int(run["pull_requests_seen"])
         for _ in range(_DISCOVERY_PAGES_PER_BATCH):
@@ -110,12 +123,31 @@ class PatchworkService:
                 if (
                     number not in known
                     and len(candidates) < int(run["requested_pull_limit"])
+                    and pull.get("merged_at")
                     and is_repair_candidate(pull)
                 ):
                     candidates.append(number)
                     known.add(number)
+                    summaries[str(number)] = {
+                        key: pull.get(key)
+                        for key in (
+                            "number",
+                            "title",
+                            "body",
+                            "html_url",
+                            "merged_at",
+                            "merge_commit_sha",
+                            "labels",
+                            "updated_at",
+                        )
+                    }
             state["next_page"] = page + 1
-            if len(pulls) < 100 or page == _MAX_HISTORY_PAGES:
+            state["history_complete"] = (
+                len(candidates) >= int(run["requested_pull_limit"])
+                or len(pulls) < 100
+                or page == _MAX_HISTORY_PAGES
+            )
+            if state["history_complete"] or len(candidates) > int(state["next_candidate_index"]):
                 state["phase"] = "indexing"
             self.index.update_patchwork_sync_run(
                 run_id,
@@ -148,23 +180,61 @@ class PatchworkService:
         offset = int(state["next_candidate_index"])
         documents = int(run["patch_cards_indexed"])
         chunks = int(run["chunks_indexed"])
+        existing = {
+            document["metadata"].get("pull_number"): document["metadata"]
+            for document in self.index.list_documents_for_repository(repository_id)
+            if isinstance(document.get("metadata"), dict)
+        }
         stop = min(offset + _DETAIL_PULLS_PER_BATCH, len(candidates))
-        for candidate_index in range(offset, stop):
-            card = client.patch_card(repository, candidates[candidate_index])
-            if card:
-                report = self.rag.ingest_documents(
-                    [_repository_documents(card.document, repository_id)]
-                )
-                documents += report.documents_indexed + report.documents_unchanged
-                chunks += report.chunks_indexed
-            state["next_candidate_index"] = candidate_index + 1
-            self.index.update_patchwork_sync_run(
-                run_id,
-                status="running",
-                state=state,
-                patch_cards_indexed=documents,
-                chunks_indexed=chunks,
-            )
+        with ThreadPoolExecutor(max_workers=self.rag.settings.github_fetch_workers) as executor:
+            pending: dict[int, Future[PatchCard | None]] = {}
+            unchanged: set[int] = set()
+            for candidate_index in range(offset, stop):
+                number = candidates[candidate_index]
+                summary = state.get("candidate_summaries", {}).get(str(number))
+                previous = existing.get(number, {})
+                if (
+                    summary
+                    and summary.get("updated_at")
+                    and previous.get("pull_updated_at") == summary["updated_at"]
+                    and previous.get("patch_card_version") == PATCH_CARD_VERSION
+                ):
+                    unchanged.add(candidate_index)
+                else:
+                    pending[candidate_index] = executor.submit(
+                        client.patch_card, repository, number, summary=summary
+                    )
+            try:
+                for candidate_index in range(offset, stop):
+                    number = candidates[candidate_index]
+                    card = pending[candidate_index].result() if candidate_index in pending else None
+                    if candidate_index in unchanged:
+                        documents += 1
+                    elif card:
+                        report = self.rag.ingest_documents(
+                            [_repository_documents(card.document, repository_id)]
+                        )
+                        if report.failures:
+                            raise RuntimeError(
+                                "Could not index PR #" + str(number) + ": " + report.failures[0]
+                            )
+                        documents += report.documents_indexed + report.documents_unchanged
+                        chunks += report.chunks_indexed
+                    # Commit in discovery order. A failure can only resume at the
+                    # first PR that has not yet been durably indexed.
+                    state.get("candidate_summaries", {}).pop(str(number), None)
+                    state["next_candidate_index"] = candidate_index + 1
+                    self.index.update_patchwork_sync_run(
+                        run_id,
+                        status="running",
+                        state=state,
+                        patch_cards_indexed=documents,
+                        chunks_indexed=chunks,
+                    )
+            except BaseException:
+                for future in pending.values():
+                    future.cancel()
+                raise
 
         if int(state["next_candidate_index"]) < len(candidates):
             self.index.update_patchwork_sync_run(
@@ -181,6 +251,17 @@ class PatchworkService:
         self.index.replace_patchwork_evaluation_cases(
             repository_id, _evaluation_manifest_from_documents(documents_for_repository)
         )
+        if not state.get("history_complete", True):
+            state["phase"] = "discovering"
+            self.index.update_patchwork_sync_run(
+                run_id,
+                status="queued",
+                state=state,
+                patch_cards_indexed=documents,
+                chunks_indexed=chunks,
+                error=None,
+            )
+            return
         self.index.update_patchwork_sync_run(
             run_id,
             status="completed",
@@ -212,9 +293,15 @@ class PatchworkService:
         if not self.index.get_patchwork_repository(repository_id, user_id=user_id):
             raise KeyError(f"Repository not found: {repository_id}")
         retrieval = self.investigator.retrieve(repository_id, issue, limit=limit)
-        matches = _deduplicated_patch_matches(retrieval.citations)
+        texts = self.index.patchwork_evidence(
+            repository_id, [hit.source for hit in retrieval.citations]
+        )
+        citations = tuple(
+            replace(hit, text=texts.get(hit.source, hit.text)) for hit in retrieval.citations
+        )
+        matches = _deduplicated_patch_matches(citations)
         summary = _investigation_summary(matches)
-        recommended_solution = self.solution_agent.recommend(issue, matches, retrieval.citations)
+        recommended_solution = self.solution_agent.recommend(issue, matches, citations)
         recommended_solution_details = recommended_solution.as_api_details()
         if matches:
             matches[0]["recommended_solution"] = recommended_solution_details
@@ -237,28 +324,38 @@ class PatchworkService:
         return {**result, "investigation_id": saved["id"], "saved_at": saved["created_at"]}
 
     def evaluate(
-        self, repository_id: str, *, user_id: str, limit: int = 5
+        self, repository_id: str, *, user_id: str, limit: int = 5, max_cases: int = 50
     ) -> dict[str, object]:
+        if not 1 <= max_cases <= 200 or not 1 <= limit <= 10:
+            raise ValueError("Evaluation requires 1–200 cases and a retrieval limit of 1–10")
         if not self.index.get_patchwork_repository(repository_id, user_id=user_id):
             raise KeyError(f"Repository not found: {repository_id}")
         run = self.index.create_patchwork_evaluation_run(repository_id)
+        started = time.monotonic()
         try:
+            documents = self.index.list_documents_for_repository(repository_id)
             benchmarks = self.index.list_patchwork_evaluation_cases(repository_id)
             if not benchmarks:
-                # Existing local documents may contain an issue body in their
-                # patch card, so they receive only a clearly-labelled smoke
-                # test until a fresh sync creates a leakage-safe manifest.
-                benchmarks = _legacy_evaluation_cases(
-                    self.index.list_documents_for_repository(repository_id)
-                )
+                benchmarks = _evaluation_manifest_from_documents(documents)
+            if not benchmarks:
+                benchmarks = _legacy_evaluation_cases(documents)
+            available_cases = len(benchmarks)
+            # A reproducible, evenly spread sample keeps the interactive lab bounded.
+            if len(benchmarks) > max_cases:
+                benchmarks = [
+                    benchmarks[index * len(benchmarks) // max_cases] for index in range(max_cases)
+                ]
             reciprocal_ranks: list[float] = []
             retrieved_at_one = 0
             retrieved_at_three = 0
             failures: list[dict[str, object]] = []
+            results: list[dict[str, object]] = []
             for benchmark in benchmarks:
                 query = str(benchmark["query"])
                 source_kind = str(benchmark["provenance"])
-                hits = self.investigator.retrieve(repository_id, query, limit=limit).citations
+                hits = self.investigator.retrieve(
+                    repository_id, query, limit=max(3, limit)
+                ).citations
                 rank = next(
                     (
                         position
@@ -270,31 +367,54 @@ class PatchworkService:
                 reciprocal_ranks.append(1 / rank if rank else 0.0)
                 retrieved_at_one += int(rank == 1)
                 retrieved_at_three += int(rank is not None and rank <= 3)
-                if not rank and len(failures) < 10:
-                    failures.append(
+                case_result = {
+                    "expected_pull_number": benchmark.get("expected_pull_number"),
+                    "expected_pull_url": _source_url(str(benchmark["expected_source"])),
+                    "issue_url": benchmark.get("issue_url"),
+                    "query": query[:1200],
+                    "rank": rank,
+                    "failure_type": "retrieval_miss"
+                    if rank is None
+                    else ("wrong_top_result" if rank > 1 else None),
+                    "source_kind": source_kind,
+                    "retrieved": [
                         {
-                            "expected_pull_number": benchmark.get("expected_pull_number"),
-                            "issue_url": benchmark.get("issue_url"),
-                            "query": query[:280],
-                            "failure_type": "retrieval_miss",
-                            "source_kind": source_kind,
+                            "pull_number": hit.metadata.get("pull_number"),
+                            "pull_url": hit.metadata.get("pull_url", hit.source),
+                            "title": hit.metadata.get("pull_title", hit.metadata.get("filename")),
+                            "score": hit.metadata.get("agent_relevance_score", hit.score),
                         }
-                    )
+                        for hit in hits
+                    ],
+                }
+                results.append(case_result)
+                if rank != 1 and len(failures) < 10:
+                    failures.append(case_result)
             total = len(benchmarks)
             verified_cases = sum(
                 1
                 for benchmark in benchmarks
-                if benchmark["provenance"] != "pr_description_smoke_test"
+                if benchmark["provenance"] in {"github_closing_reference", "pr_closing_keyword"}
             )
-            smoke_test_cases = total - verified_cases
+            user_cases = sum(
+                benchmark["provenance"] == "user_labeled_issue" for benchmark in benchmarks
+            )
+            smoke_test_cases = total - verified_cases - user_cases
             metrics: dict[str, object] = {
                 "recall_at_1": round(retrieved_at_one / total, 3) if total else None,
                 "recall_at_3": round(retrieved_at_three / total, 3) if total else None,
                 "mrr": round(sum(reciprocal_ranks) / total, 3) if total else None,
                 "failure_samples": failures,
-                "quality": "verified_issue_to_fix" if verified_cases else "smoke_test",
+                "case_results": results,
+                "available_cases": available_cases,
+                "indexed_fixes": len(documents),
+                "duration_seconds": round(time.monotonic() - started, 2),
+                "quality": "verified_issue_to_fix"
+                if verified_cases
+                else ("user_labeled_issue_to_fix" if user_cases else "smoke_test"),
                 "case_breakdown": {
                     "verified_issue_to_fix": verified_cases,
+                    "user_labeled_issue": user_cases,
                     "pr_description_smoke_test": smoke_test_cases,
                 },
                 "protocol": {
@@ -303,11 +423,23 @@ class PatchworkService:
                         "indexed patch cards."
                     ),
                     "candidate_pool": "Historical patch cards from the selected repository only.",
-                    "retrieval_limit": limit,
+                    "retrieval_limit": max(3, limit),
+                    "case_limit": max_cases,
                 },
-                "note": _evaluation_note(verified_cases, smoke_test_cases) if total else (
+                "note": (
+                    f"Tested {user_cases} user-labeled issue-to-fix pair(s). "
+                    "These labels were provided by you; inspect the results to confirm them. "
+                    + (_evaluation_note(verified_cases, smoke_test_cases) if verified_cases else "")
+                )
+                if user_cases
+                else _evaluation_note(verified_cases, smoke_test_cases)
+                if total
+                else (
                     "No historical fix descriptions were found. Sync this repository before "
                     "evaluating."
+                ),
+                "recommendations": _evaluation_recommendations(
+                    total, len(documents), verified_cases + user_cases, retrieved_at_one, failures
                 ),
             }
             return self.index.finish_patchwork_evaluation_run(
@@ -323,6 +455,28 @@ class PatchworkService:
                 benchmark_cases=0,
                 error=str(error),
             )
+
+    def add_evaluation_case(
+        self, repository_id: str, *, user_id: str, issue: str, expected_pull_number: int
+    ) -> dict[str, object]:
+        if len(issue.strip()) < 8:
+            raise ValueError("Describe the bug report using at least 8 non-whitespace characters")
+        if not self.index.get_patchwork_repository(repository_id, user_id=user_id):
+            raise KeyError(repository_id)
+        for document in self.index.list_documents_for_repository(repository_id):
+            metadata = document["metadata"]
+            if metadata.get("pull_number") == expected_pull_number:
+                case = {
+                    "expected_source": document["source"],
+                    "expected_pull_number": expected_pull_number,
+                    "query": issue.strip(),
+                    "provenance": "user_labeled_issue",
+                    "issue_number": None,
+                    "issue_url": None,
+                }
+                self.index.save_patchwork_evaluation_case(repository_id, case)
+                return case
+        raise ValueError("The expected PR must be indexed in this repository. Sync it first.")
 
     def investigations(self, repository_id: str, *, user_id: str) -> list[dict[str, object]]:
         if not self.index.get_patchwork_repository(repository_id, user_id=user_id):
@@ -341,6 +495,7 @@ class PatchworkService:
             token=account_token or self.rag.settings.github_token,
             timeout=self.rag.settings.request_timeout_seconds,
             graphql_url=self.rag.settings.github_graphql_url,
+            minimum_request_interval_seconds=self.rag.settings.github_request_interval_seconds,
             oauth_client_id=self.rag.settings.github_oauth_client_id,
             oauth_client_secret=self.rag.settings.github_oauth_client_secret,
         )
@@ -371,7 +526,13 @@ def _evaluation_cases(
         overview = document.get("overview_text")
         if not isinstance(overview, str):
             continue
-        description = _patch_excerpt(overview)
+        body = metadata.get("pull_body")
+        if isinstance(body, str) and body.strip():
+            description = _clean_pull_request_prose(body)
+        elif "## Problem and resolution" in overview:
+            description = _patch_excerpt(overview)
+        else:
+            description = str(metadata.get("pull_title") or "")
         if len(description) >= 30:
             cases.append((document, description, "pr_description_smoke_test"))
     return cases
@@ -457,12 +618,17 @@ def _sync_state(raw_state: object) -> dict[str, object]:
         for number in raw.get("candidate_pull_numbers", [])
         if isinstance(number, int) or (isinstance(number, str) and number.isdigit())
     ]
-    return {
+    normalized = {
         "phase": phase,
         "next_page": max(1, int(raw.get("next_page", 1))),
         "candidate_pull_numbers": list(dict.fromkeys(candidates)),
         "next_candidate_index": max(0, int(raw.get("next_candidate_index", 0))),
     }
+    if isinstance(raw.get("candidate_summaries"), dict):
+        normalized["candidate_summaries"] = raw["candidate_summaries"]
+    if "history_complete" in raw:
+        normalized["history_complete"] = bool(raw["history_complete"])
+    return normalized
 
 
 def _evaluation_note(verified_cases: int, smoke_test_cases: int) -> str:
@@ -488,6 +654,47 @@ def _evaluation_note(verified_cases: int, smoke_test_cases: int) -> str:
     )
 
 
+def _evaluation_recommendations(
+    total: int,
+    documents: int,
+    issue_cases: int,
+    top_hits: int,
+    failures: list[dict[str, object]],
+) -> list[str]:
+    if not documents:
+        return ["Sync a repository before evaluating; there are no indexed fixes to search."]
+    advice: list[str] = []
+    if not issue_cases:
+        advice.append(
+            "These PR-description checks only test indexing. Add a real bug report and its "
+            "expected PR below to test whether recommendations are useful."
+        )
+    if not total:
+        advice.append("Add a test issue and an indexed expected PR to create your first check.")
+    elif top_hits < total:
+        advice.append(
+            "Review the missed examples below. Compare the returned PRs with the expected fix; "
+            "include the incident's error, symbol or affected file when investigating."
+        )
+    else:
+        advice.append(
+            "Every sampled check ranked its expected PR first. Try additional reports in your "
+            "own words before relying on this result."
+        )
+    if documents < 30:
+        advice.append(
+            f"Only {documents} fixes are indexed. A broader sync adds competing fixes and makes "
+            "the check more representative."
+        )
+    return advice
+
+
+def _source_url(source: str) -> str | None:
+    if "https://" in source:
+        return "https://" + source.split("https://", 1)[1]
+    return None
+
+
 def _deduplicated_patch_matches(citations: tuple[Any, ...]) -> list[dict[str, object]]:
     matches: list[dict[str, object]] = []
     seen_sources: set[str] = set()
@@ -500,7 +707,11 @@ def _deduplicated_patch_matches(citations: tuple[Any, ...]) -> list[dict[str, ob
                 "pull_number": hit.metadata.get("pull_number"),
                 "pull_url": hit.metadata.get("pull_url", hit.source),
                 "title": hit.metadata.get("filename", "Historical patch"),
-                "score": round(hit.score, 4),
+                # This is a calibrated evidence score, not an assertion that a
+                # historical PR is certainly the right fix.
+                "score": round(float(hit.metadata.get("agent_relevance_score", hit.score)), 4),
+                "match_reasons": hit.metadata.get("agent_match_reasons", []),
+                "matched_terms": hit.metadata.get("agent_matched_terms", []),
                 "merge_commit_sha": hit.metadata.get("merge_commit_sha"),
                 "linked_issue_number": hit.metadata.get("linked_issue_number"),
                 "linked_issue_url": hit.metadata.get("linked_issue_url"),
@@ -525,11 +736,25 @@ def _investigation_summary(matches: list[dict[str, object]]) -> str:
     leading = matches[0]
     title = re.sub(r"^PR #\d+\s*·\s*", "", str(leading["title"]))
     pull_number = leading.get("pull_number")
+    reasons = leading.get("match_reasons")
+    reason = _summary_reason(reasons[0]) if isinstance(reasons, list) and reasons else ""
     return (
         f"Start with PR #{pull_number}, \u201c{title}.\u201d It is the closest historical "
         "fix in this repository; review its implementation and regression coverage before "
-        "applying the same approach."
+        f"applying the same approach.{reason}"
     )
+
+
+def _summary_reason(value: object) -> str:
+    """Turn the first retrieval reason into a natural-language summary clause."""
+    reason = str(value).rstrip(".")
+    if reason.startswith("Matches error: "):
+        return f" It matches the reported error, {reason.removeprefix('Matches error: ')}."
+    if reason.startswith("Touches "):
+        return f" It changes {reason.removeprefix('Touches ')}."
+    if reason.startswith("References "):
+        return f" It references {reason.removeprefix('References ')}."
+    return f" {reason}."
 
 
 def _patch_excerpt(text: str) -> str:
@@ -557,8 +782,14 @@ def _clean_pull_request_prose(text: str) -> str:
     text = re.sub(r"```[\s\S]*?```", " ", text)
 
     useful_lines: list[str] = []
+    skip_section = False
     for raw_line in text.splitlines():
         line = raw_line.strip()
+        if line.startswith("#"):
+            heading = re.sub(r"^#{1,6}\s*", "", line).strip().lower().rstrip(":")
+            skip_section = heading in {"ai disclaimer", "ai disclosure", "ai usage"}
+        if skip_section:
+            continue
         if not line or line.startswith(("```", "<")):
             continue
         normalized = re.sub(r"^#{1,6}\s*", "", line).strip().lower().rstrip(":")

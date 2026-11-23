@@ -287,6 +287,74 @@ class PostgresIndex:
             ).fetchone()
         return row is not None
 
+    def summary_document_states(self, sources: Sequence[str]) -> dict[str, tuple[str, str]]:
+        if not sources:
+            return {}
+        with self._connection() as connection:
+            rows = connection.execute(
+                "SELECT source, content_sha256, metadata->>'evidence_level' AS level "
+                "FROM documents WHERE source = ANY(%s)",
+                (list(sources),),
+            ).fetchall()
+        return {
+            str(row["source"]): (str(row["content_sha256"]), str(row["level"] or "full"))
+            for row in rows
+        }
+
+    def replace_summary_documents(
+        self,
+        records: Sequence[
+            tuple[SourceDocument, str, Sequence[TextChunk], Sequence[Sequence[float]]]
+        ],
+    ) -> set[str]:
+        """Replace summaries in one transaction without downgrading detailed cards."""
+        if not records:
+            return set()
+        for _, _, chunks, vectors in records:
+            if not chunks or len(chunks) != len(vectors):
+                raise ValueError("Each document needs chunks with matching embeddings")
+            if not vectors[0] or any(len(vector) != len(vectors[0]) for vector in vectors):
+                raise ValueError("Embeddings must have a shared, non-zero dimension")
+        sources = [document.source for document, _, _, _ in records]
+        values = [
+            {
+                "id": document_id, "source": document.source,
+                "hash": document.metadata["content_sha256"],
+                "content_type": document.content_type, "metadata": document.metadata,
+            }
+            for document, document_id, _, _ in records
+        ]
+        with self._connection() as connection:
+            connection.execute(
+                "DELETE FROM documents WHERE source = ANY(%s) "
+                "AND metadata->>'evidence_level' = 'summary'", (sources,),
+            )
+            rows = connection.execute(
+                """
+                INSERT INTO documents (id, source, content_sha256, content_type, metadata)
+                SELECT item->>'id', item->>'source', item->>'hash',
+                       item->>'content_type', item->'metadata'
+                FROM jsonb_array_elements(%s::jsonb) AS item
+                ON CONFLICT (source) DO NOTHING RETURNING id
+                """,
+                (Jsonb(values),),
+            ).fetchall()
+            inserted = {str(row["id"]) for row in rows}
+            chunk_rows = [
+                (chunk.id, document_id, chunk.ordinal, chunk.text, chunk.start_offset,
+                 chunk.end_offset, Jsonb(chunk.metadata), list(vector), len(vector))
+                for _, document_id, chunks, vectors in records if document_id in inserted
+                for chunk, vector in zip(chunks, vectors, strict=True)
+            ]
+            if chunk_rows:
+                with connection.cursor() as cursor:
+                    cursor.executemany(
+                        "INSERT INTO chunks (id, document_id, ordinal, text, start_offset, "
+                        "end_offset, metadata, embedding, embedding_dimensions) "
+                        "VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s)", chunk_rows,
+                    )
+        return inserted
+
     def replace_document(
         self,
         document: SourceDocument,
@@ -465,9 +533,7 @@ class PostgresIndex:
             )
         return result.rowcount
 
-    def create_session(
-        self, user_id: str, token_hash: str, expires_at: object
-    ) -> None:
+    def create_session(self, user_id: str, token_hash: str, expires_at: object) -> None:
         with self._connection() as connection:
             connection.execute(
                 """
@@ -578,6 +644,30 @@ class PostgresIndex:
             )
         return result.rowcount > 0
 
+    def patchwork_evidence(self, repository_id: str, sources: Sequence[str]) -> dict[str, str]:
+        """Hydrate selected PRs, retaining diff context beyond the winning chunk."""
+        if not sources:
+            return {}
+        with self._connection() as connection:
+            rows = connection.execute(
+                """
+                SELECT documents.source, chunks.text, chunks.start_offset, chunks.end_offset
+                FROM documents JOIN chunks ON chunks.document_id = documents.id
+                WHERE documents.metadata ->> 'patchwork_repository_id' = %s
+                  AND documents.source = ANY(%s) AND chunks.start_offset < 16000
+                ORDER BY documents.source, chunks.ordinal
+                """,
+                (repository_id, list(sources)),
+            ).fetchall()
+        texts: dict[str, list[str]] = {}
+        for row in rows:
+            buffer = texts.setdefault(str(row["source"]), [])
+            start, end = int(row["start_offset"]), min(int(row["end_offset"]), 16000)
+            if len(buffer) < end:
+                buffer.extend(" " * (end - len(buffer)))
+            buffer[start:end] = row["text"][: end - start]
+        return {source: "".join(buffer) for source, buffer in texts.items()}
+
     def list_documents_for_repository(self, repository_id: str) -> list[dict[str, object]]:
         with self._connection() as connection:
             rows = connection.execute(
@@ -684,6 +774,8 @@ class PostgresIndex:
                        sync_runs.patch_cards_indexed AS latest_sync_patch_cards,
                        sync_runs.chunks_indexed AS latest_sync_chunks,
                        sync_runs.error AS latest_sync_error,
+                       sync_runs.state AS latest_sync_state,
+                       sync_runs.available_at AS latest_sync_available_at,
                        sync_runs.created_at AS latest_sync_created_at,
                        sync_runs.finished_at AS latest_sync_finished_at
                 FROM patchwork_repositories AS repositories
@@ -806,7 +898,8 @@ class PostgresIndex:
         """Persist an evaluation manifest produced during the same repository sync."""
         with self._connection() as connection:
             connection.execute(
-                "DELETE FROM patchwork_evaluation_cases WHERE repository_id = %s",
+                "DELETE FROM patchwork_evaluation_cases WHERE repository_id = %s "
+                "AND provenance <> 'user_labeled_issue'",
                 (repository_id,),
             )
             if not cases:
@@ -818,6 +911,7 @@ class PostgresIndex:
                         repository_id, expected_source, expected_pull_number, query,
                         provenance, issue_number, issue_url
                     ) VALUES (%s, %s, %s, %s, %s, %s, %s)
+                    ON CONFLICT (repository_id, expected_source) DO NOTHING
                     """,
                     [
                         (
@@ -832,6 +926,25 @@ class PostgresIndex:
                         for case in cases
                     ],
                 )
+
+    def save_patchwork_evaluation_case(self, repository_id: str, case: dict[str, object]) -> None:
+        with self._connection() as connection:
+            connection.execute(
+                """
+                INSERT INTO patchwork_evaluation_cases (
+                    repository_id, expected_source, expected_pull_number, query, provenance
+                ) VALUES (%s, %s, %s, %s, 'user_labeled_issue')
+                ON CONFLICT (repository_id, expected_source) DO UPDATE
+                SET query = EXCLUDED.query, provenance = EXCLUDED.provenance,
+                    issue_number = NULL, issue_url = NULL, created_at = CURRENT_TIMESTAMP
+                """,
+                (
+                    repository_id,
+                    case["expected_source"],
+                    case["expected_pull_number"],
+                    case["query"],
+                ),
+            )
 
     def list_patchwork_evaluation_cases(self, repository_id: str) -> list[dict[str, object]]:
         with self._connection() as connection:
@@ -969,9 +1082,7 @@ def _timestamp(value: object) -> str | None:
     return value.isoformat() if value is not None else None
 
 
-def _user_row(
-    row: dict[str, object], *, include_password_hash: bool = False
-) -> dict[str, object]:
+def _user_row(row: dict[str, object], *, include_password_hash: bool = False) -> dict[str, object]:
     user = {
         "id": row["id"],
         "email": row["email"],
@@ -1004,6 +1115,8 @@ def _repository_row(row: dict[str, object], *, include_sync: bool = False) -> di
                 "patch_cards_indexed": row["latest_sync_patch_cards"],
                 "chunks_indexed": row["latest_sync_chunks"],
                 "error": row["latest_sync_error"],
+                "progress": _sync_progress(row["latest_sync_state"]),
+                "available_at": _timestamp(row["latest_sync_available_at"]),
                 "created_at": _timestamp(row["latest_sync_created_at"]),
                 "finished_at": _timestamp(row["latest_sync_finished_at"]),
             }
@@ -1025,10 +1138,28 @@ def _sync_run_row(row: dict[str, object]) -> dict[str, object]:
         "attempt_count": row["attempt_count"],
         "state": row["state"],
         "error": row["error"],
+        "available_at": _timestamp(row["available_at"]),
         "created_at": _timestamp(row["created_at"]),
         "started_at": _timestamp(row["started_at"]),
         "finished_at": _timestamp(row["finished_at"]),
     }
+
+
+def _sync_progress(state: object) -> dict[str, object] | None:
+    """Expose only human-useful progress; never return queued PR identifiers."""
+    if not isinstance(state, dict):
+        return None
+    phase = state.get("phase")
+    candidates = state.get("candidate_pull_numbers")
+    next_candidate = state.get("next_candidate_index")
+    progress: dict[str, object] = {}
+    if phase in {"discovering", "indexing"}:
+        progress["phase"] = phase
+    if isinstance(candidates, list):
+        progress["candidates_discovered"] = len(candidates)
+    if isinstance(next_candidate, int):
+        progress["candidates_processed"] = next_candidate
+    return progress or None
 
 
 def _initial_sync_state() -> dict[str, object]:

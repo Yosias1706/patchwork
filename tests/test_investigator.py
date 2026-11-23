@@ -77,3 +77,27 @@ def test_investigation_agent_uses_multiple_scoped_searches_and_fuses_sources() -
     ]
     assert outcome.retrieval.confidence == "high"
     assert "ConnectionResetError" in outcome.answer
+
+
+def test_unrelated_report_does_not_get_an_unsupported_recommendation() -> None:
+    service = RAGService(_settings(), index=InMemoryIndex())
+    service.ingest_documents(
+        [
+            SourceDocument(
+                source="https://github.com/example/api/pull/42",
+                text=("Fix async dependency cleanup when a request is cancelled. "
+                      "Await stream cleanup."),
+                content_type="text/x-patchwork-card",
+                metadata={
+                    "patchwork_repository_id": "repo-a",
+                    "test_files": ["tests/test_stream.py"],
+                },
+            )
+        ]
+    )
+    result = InvestigationAgent(service).retrieve(
+        "repo-a",
+        "Database transactions deadlock when inventory locks are acquired in opposite order.",
+    )
+    assert result.citations == ()
+    assert result.confidence == "no_similar_fix_found"

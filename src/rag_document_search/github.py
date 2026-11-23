@@ -6,6 +6,7 @@ import base64
 import hashlib
 import json
 import re
+import threading
 import time
 import urllib.error
 import urllib.parse
@@ -14,6 +15,8 @@ from dataclasses import dataclass
 from typing import Any
 
 from .models import SourceDocument
+
+PATCH_CARD_VERSION = 2
 
 _REPAIR_WORDS = re.compile(
     r"\b("
@@ -117,6 +120,8 @@ class GitHubClient:
         self.graphql_url = (graphql_url or f"{self.api_url}/graphql").rstrip("/")
         self.minimum_request_interval_seconds = max(0.0, minimum_request_interval_seconds)
         self._next_request_at = 0.0
+        self._request_condition = threading.Condition()
+        self._rate_limited: GitHubRateLimited | None = None
         self.oauth_client_id = oauth_client_id
         self.oauth_client_secret = oauth_client_secret
 
@@ -150,9 +155,7 @@ class GitHubClient:
         if not 1 <= limit <= 10_000:
             raise ValueError("Patchwork supports between 1 and 10000 historical fixes per sync")
         all_pulls = self._closed_pull_history(repository)
-        labelled_pulls = [
-            pull for pull in all_pulls if _has_bug_label(pull) and pull.get("number")
-        ]
+        labelled_pulls = [pull for pull in all_pulls if _has_bug_label(pull) and pull.get("number")]
         pulls = _balanced_repair_candidates(labelled_pulls, all_pulls, limit)
 
         cards: list[PatchCard] = []
@@ -162,12 +165,10 @@ class GitHubClient:
                 cards.append(card)
         return len(all_pulls), cards
 
-    def closed_pull_page(
-        self, repository: GitHubRepository, *, page: int
-    ) -> list[dict[str, Any]]:
+    def closed_pull_page(self, repository: GitHubRepository, *, page: int) -> list[dict[str, Any]]:
         """Return one stable, 100-PR page of a repository's closed history."""
-        if not 1 <= page <= 100:
-            raise ValueError("Patchwork supports up to 10,000 closed pull requests per sync")
+        if not 1 <= page <= 1000:
+            raise ValueError("Patchwork supports up to 100,000 closed pull requests per sync")
         pulls = self._get(
             f"/repos/{repository.owner}/{repository.name}/pulls",
             {
@@ -183,11 +184,24 @@ class GitHubClient:
         return [pull for pull in pulls if isinstance(pull, dict)]
 
     def patch_card(
-        self, repository: GitHubRepository, pull_number: int
+        self,
+        repository: GitHubRepository,
+        pull_number: int,
+        *,
+        summary: dict[str, Any] | None = None,
+        allow_non_repair: bool = False,
     ) -> PatchCard | None:
         """Fetch one candidate's evidence, intended for a durable worker batch."""
-        pull = self._get(f"/repos/{repository.owner}/{repository.name}/pulls/{pull_number}")
-        if not isinstance(pull, dict) or not pull.get("merged_at") or not _looks_like_bug_fix(pull):
+        # The listing already contains the description, merge and label fields.
+        # Reusing it saves one API request for every selected PR.
+        pull = summary or self._get(
+            f"/repos/{repository.owner}/{repository.name}/pulls/{pull_number}"
+        )
+        if (
+            not isinstance(pull, dict)
+            or not pull.get("merged_at")
+            or (not allow_non_repair and not is_repair_candidate(pull))
+        ):
             return None
         files = self._get(
             f"/repos/{repository.owner}/{repository.name}/pulls/{pull_number}/files",
@@ -222,27 +236,30 @@ class GitHubClient:
         written with a closing keyword in the PR body. Public unauthenticated
         syncs retain the explicit-keyword fallback so the product remains useful.
         """
+        issue_numbers = _closing_issue_numbers(_optional_text(pull.get("body")) or "")
+        for issue_number in issue_numbers[:3]:
+            try:
+                issue = self._get(
+                    f"/repos/{repository.owner}/{repository.name}/issues/{issue_number}"
+                )
+            except GitHubRateLimited:
+                raise
+            except GitHubError:
+                continue
+            if isinstance(issue, dict) and "pull_request" not in issue:
+                return GitHubIssueLink(issue, "pr_closing_keyword")
         if self.token:
             try:
                 linked = self._closing_issue_references(repository, int(pull["number"]))
                 if linked:
                     return GitHubIssueLink(linked[0], "github_closing_reference")
+            except GitHubRateLimited:
+                raise
             except GitHubError:
                 # The REST ingestion is still valid if GraphQL is unavailable
                 # or an organization restricts this optional field.
                 pass
-        issue_numbers = _closing_issue_numbers(_optional_text(pull.get("body")) or "")
-        if not issue_numbers:
-            return None
-        try:
-            issue = self._get(
-                f"/repos/{repository.owner}/{repository.name}/issues/{issue_numbers[0]}"
-            )
-        except GitHubError:
-            return None
-        if not isinstance(issue, dict) or "pull_request" in issue:
-            return None
-        return GitHubIssueLink(issue, "pr_closing_keyword")
+        return None
 
     def _closing_issue_references(
         self, repository: GitHubRepository, pull_number: int
@@ -270,6 +287,15 @@ class GitHubClient:
         )
         errors = payload.get("errors") if isinstance(payload, dict) else None
         if errors:
+            if any(
+                isinstance(error, dict)
+                and (
+                    str(error.get("type", "")).upper() == "RATE_LIMITED"
+                    or "rate limit" in str(error.get("message", "")).lower()
+                )
+                for error in errors
+            ):
+                raise self._stop_for_rate_limit({})
             raise GitHubError("GitHub could not read pull-request closing references")
         nodes = (
             payload.get("data", {})
@@ -293,12 +319,11 @@ class GitHubClient:
             try:
                 self._wait_for_request_slot()
                 with urllib.request.urlopen(request, timeout=self.timeout) as response:
-                    self._record_request_slot()
                     return json.loads(response.read().decode("utf-8"))
             except urllib.error.HTTPError as error:
                 detail = error.read().decode("utf-8", errors="replace")[:350]
-                if error.code in {403, 429}:
-                    raise GitHubRateLimited(_retry_after_seconds(error.headers)) from error
+                if _is_rate_limit(error.code, error.headers, detail):
+                    raise self._stop_for_rate_limit(error.headers) from error
                 if error.code == 404:
                     raise GitHubError(
                         "GitHub could not find this repository. If it is private, link your "
@@ -327,12 +352,11 @@ class GitHubClient:
         try:
             self._wait_for_request_slot()
             with urllib.request.urlopen(request, timeout=self.timeout) as response:
-                self._record_request_slot()
                 return json.loads(response.read().decode("utf-8"))
         except urllib.error.HTTPError as error:
             detail = error.read().decode("utf-8", errors="replace")[:350]
-            if error.code in {403, 429}:
-                raise GitHubRateLimited(_retry_after_seconds(error.headers)) from error
+            if _is_rate_limit(error.code, error.headers, detail):
+                raise self._stop_for_rate_limit(error.headers) from error
             raise GitHubError(f"GitHub returned HTTP {error.code}: {detail}") from error
         except (TimeoutError, urllib.error.URLError) as error:
             raise GitHubError("GitHub did not respond before the request timeout") from error
@@ -351,23 +375,35 @@ class GitHubClient:
         return headers
 
     def _wait_for_request_slot(self) -> None:
-        delay = self._next_request_at - time.monotonic()
-        if delay > 0:
-            time.sleep(delay)
+        with self._request_condition:
+            while True:
+                if self._rate_limited:
+                    raise self._rate_limited
+                now = time.monotonic()
+                delay = self._next_request_at - now
+                if delay <= 0:
+                    self._next_request_at = now + self.minimum_request_interval_seconds
+                    return
+                self._request_condition.wait(timeout=delay)
 
-    def _record_request_slot(self) -> None:
-        self._next_request_at = time.monotonic() + self.minimum_request_interval_seconds
+    def _stop_for_rate_limit(self, headers: Any) -> GitHubRateLimited:
+        error = GitHubRateLimited(_retry_after_seconds(headers))
+        with self._request_condition:
+            if not self._rate_limited or (
+                error.retry_after_seconds > self._rate_limited.retry_after_seconds
+            ):
+                self._rate_limited = error
+            self._request_condition.notify_all()
+            return self._rate_limited
 
 
 def _looks_like_bug_fix(pull: dict[str, Any]) -> bool:
     labels = " ".join(
         str(label.get("name", "")) for label in pull.get("labels", []) if isinstance(label, dict)
     )
-    candidate_text = " ".join(
-        part
-        for part in (str(pull.get("title", "")), _optional_text(pull.get("body")), labels)
-        if part
-    )
+    # Templates and release notes often mention "fix" even on unrelated PRs.
+    # Require a repair signal in the title/labels or an explicit closing reference.
+    candidate_text = str(pull.get("title", "")) + " " + labels
     return bool(_REPAIR_WORDS.search(candidate_text)) or bool(
         _CLOSING_ISSUE.search(_optional_text(pull.get("body")) or "")
     )
@@ -394,6 +430,18 @@ def _retry_after_seconds(headers: Any) -> int:
     if reset and str(reset).isdigit():
         return max(30, int(reset) - int(time.time()) + 5)
     return 60
+
+
+def _is_rate_limit(status: int, headers: Any, detail: str) -> bool:
+    return status == 429 or (
+        status == 403
+        and (
+            str(headers.get("X-RateLimit-Remaining")) == "0"
+            or bool(headers.get("Retry-After"))
+            or "rate limit" in detail.lower()
+            or "secondary rate" in detail.lower()
+        )
+    )
 
 
 def _balanced_repair_candidates(
@@ -429,9 +477,11 @@ def _closing_issue_numbers(body: str) -> list[int]:
 def _patch_card(
     repository: GitHubRepository,
     pull: dict[str, Any],
-    files: list[dict[str, Any]],
+    files: list[dict[str, Any]] | None,
     linked_issue: GitHubIssueLink | None,
 ) -> PatchCard:
+    summary_only = files is None
+    files = files or []
     pull_number = int(pull["number"])
     issue_numbers = _closing_issue_numbers(_optional_text(pull.get("body")) or "")
     issue = linked_issue.issue if linked_issue else None
@@ -448,11 +498,14 @@ def _patch_card(
         _optional_text(pull.get("body")) or "No pull-request description provided.", 4500
     )
     linked_issues = ", ".join(f"#{number}" for number in issue_numbers) or "not declared"
-    changed_tests = "\n".join(f"- {path}" for path in test_files) or "No test file detected."
+    changed_tests = "\n".join(f"- {path}" for path in test_files) or (
+        "File details have not been loaded yet." if summary_only else "No test file detected."
+    )
+    heading = "Historical bug fix" if is_repair_candidate(pull) else "Historical pull request"
     text = "\n\n".join(
         part
         for part in [
-            f"# Historical bug fix: {pull['title']}",
+            f"# {heading}: {pull['title']}",
             (
                 f"Repository: {repository.full_name}\n"
                 f"Pull request: #{pull_number}\n"
@@ -463,7 +516,9 @@ def _patch_card(
             ),
             "## Problem and resolution\n" + body,
             "## Changed tests\n" + changed_tests,
-            "## Relevant diff hunks\n" + "\n\n".join(patch_sections),
+            "## Relevant diff hunks\n" + (
+                "Diffs have not been loaded yet." if summary_only else "\n\n".join(patch_sections)
+            ),
         ]
         if part
     )
@@ -471,6 +526,11 @@ def _patch_card(
         "content_sha256": hashlib.sha256(text.encode("utf-8")).hexdigest(),
         "patchwork_repository_full_name": repository.full_name,
         "pull_number": pull_number,
+        "pull_title": str(pull["title"]),
+        "pull_body": body,
+        "pull_updated_at": pull.get("updated_at"),
+        "patch_card_version": PATCH_CARD_VERSION,
+        "evidence_level": "summary" if summary_only else "full",
         "pull_url": str(pull["html_url"]),
         "merge_commit_sha": _optional_text(pull.get("merge_commit_sha")),
         "merged_at": _optional_text(pull.get("merged_at")),
@@ -498,6 +558,11 @@ def _patch_card(
         linked_issue_number=linked_issue_number,
         linked_issue_provenance=linked_issue.provenance if linked_issue else None,
     )
+
+
+def summary_patch_card(repository: GitHubRepository, pull: dict[str, Any]) -> PatchCard:
+    """Create a searchable PR card directly from a paginated GitHub listing."""
+    return _patch_card(repository, pull, None, None)
 
 
 def _benchmark_query(issue: dict[str, Any] | None) -> str | None:
